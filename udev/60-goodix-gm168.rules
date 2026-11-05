@@ -1,0 +1,4 @@
+# Goodix GM168 Biometric Sensors (Xiaomi RedmiBook Pro 14S / 15, Mi NoteBook Ultra)
+# USB Product IDs: 27c6:581a, 27c6:589a
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="581a", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="589a", MODE="0666", TAG+="uaccess"

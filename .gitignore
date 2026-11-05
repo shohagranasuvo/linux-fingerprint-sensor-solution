@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.swp
+*.bak
+*~
+.DS_Store
+packaging/*.deb_build/

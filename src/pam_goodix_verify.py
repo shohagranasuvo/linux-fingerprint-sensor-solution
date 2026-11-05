@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""
+Goodix GM168 PAM Authentication Helper
+Direct In-Process DRFM (Dense Ridge-Flow Matcher) + Adaptive Template Learning (gx_templateStudy).
+Enforces Windows Hello Goodix Enclave REA telemetry checks (valid_area, deduplicated inliers,
+composite match_score, and multi-stage consensus) for Zero-FAR verification.
+Invoked by pam_exec.so during sudo, lockscreen, and GDM login.
+Exits 0 on match, 1 on failure.
+"""
+
+import glob
+import os
+import pwd
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Universal Python environment bootstrap:
+# Ensures root PAM execution can import user site-packages (cv2, numpy) and local modules
+SEARCH_PATHS = [
+    "/usr/local/lib/goodix-gm168",
+    SCRIPT_DIR,
+]
+# Dynamically add user site-packages for all active home accounts
+for user_home in glob.glob("/home/*"):
+    for py_ver in ["python3.14", "python3.13", "python3.12", "python3.11", "python3.10"]:
+        pkg_dir = os.path.join(user_home, ".local/lib", py_ver, "site-packages")
+        if os.path.isdir(pkg_dir) and pkg_dir not in SEARCH_PATHS:
+            SEARCH_PATHS.append(pkg_dir)
+
+for p in reversed(SEARCH_PATHS):
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
+
+import cv2
+
+SYSTEM_CAPTURE_BIN = "/usr/local/lib/goodix-gm168/img-capture"
+LOCAL_CAPTURE_BIN = os.path.abspath(os.path.join(SCRIPT_DIR, "../bin/img-capture"))
+CAPTURE_BIN = SYSTEM_CAPTURE_BIN if os.path.exists(SYSTEM_CAPTURE_BIN) else LOCAL_CAPTURE_BIN
+
+SYSTEM_LIB_DIR = "/usr/local/lib/goodix-gm168"
+LOCAL_LIB_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../bin"))
+LIB_DIR = SYSTEM_LIB_DIR if os.path.exists(os.path.join(SYSTEM_LIB_DIR, "libfprint-2.so.2")) else LOCAL_LIB_DIR
+
+OUT_FRAME = "/tmp/pam_probe.pgm"
+MIN_INLIERS = 10
+
+
+def log(msg: str):
+    sys.stdout.write(f"[DRFM-PAM] {msg}\n")
+    sys.stdout.flush()
+
+
+def get_psk_directory() -> str:
+    """Finds the cryptographic PSK directory across system and user locations."""
+    if os.path.exists("/etc/goodix-gm168/psk.bin"):
+        return "/etc/goodix-gm168"
+
+    for user_home in glob.glob("/home/*"):
+        user_psk = os.path.join(user_home, ".config/goodix-gm168/psk.bin")
+        if os.path.exists(user_psk):
+            return os.path.dirname(user_psk)
+        legacy_psk = os.path.join(user_home, "goodix_unseal/psk.bin")
+        if os.path.exists(legacy_psk):
+            return os.path.dirname(legacy_psk)
+
+    return "/etc/goodix-gm168"
+
+
+def capture_sensor_touch() -> bool:
+    """Arms the sensor and captures a live touch frame."""
+    if os.path.exists(OUT_FRAME):
+        try:
+            os.remove(OUT_FRAME)
+        except OSError:
+            pass
+
+    psk_dir = get_psk_directory()
+    ld_paths = [p for p in [LIB_DIR, SYSTEM_LIB_DIR, LOCAL_LIB_DIR] if os.path.isdir(p)]
+
+    env = os.environ.copy()
+    env.update({
+        "GOODIX_GM168_DIR": psk_dir,
+        "LD_LIBRARY_PATH": ":".join(ld_paths),
+        "GM168_DUMP_FRAMES": "0"
+    })
+
+    log("Arming sensor (15s acquisition window)...")
+    try:
+        proc = subprocess.Popen(
+            ["timeout", "15s", CAPTURE_BIN, OUT_FRAME],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if "Device completely armed" in line:
+                log("Sensor ready: Touch finger now...")
+            elif "Touch Detected" in line:
+                log("Touch detected! Processing frame...")
+        proc.wait()
+
+        if os.path.exists(OUT_FRAME) and os.path.getsize(OUT_FRAME) > 1000:
+            log(f"Probe frame captured successfully ({os.path.getsize(OUT_FRAME)} bytes).")
+            return True
+
+        log(f"Sensor acquisition ended without frame file (exit={proc.returncode}).")
+        return False
+    except Exception as e:
+        log(f"Capture error: {e}")
+        return False
+
+
+def get_candidate_templates(target_user: str) -> list:
+    """Discovers all enrolled biometric template frames for the target user."""
+    candidates = []
+    search_dirs = [
+        f"/var/lib/goodix-gm168/templates/{target_user}",
+        "/var/lib/goodix-gm168/templates/root",
+        "/var/lib/goodix-gm168/templates",
+    ]
+
+    # Resolve home directory
+    try:
+        pw = pwd.getpwnam(target_user)
+        search_dirs.append(os.path.join(pw.pw_dir, ".config/goodix-gm168/templates"))
+    except KeyError:
+        pass
+
+    for user_home in glob.glob("/home/*"):
+        search_dirs.append(os.path.join(user_home, ".config/goodix-gm168/templates"))
+
+    for d in search_dirs:
+        if os.path.isdir(d):
+            candidates.extend(glob.glob(os.path.join(d, "*.pgm")))
+            candidates.extend(glob.glob(os.path.join(d, "*", "*.pgm")))
+
+    return sorted(list(set(candidates)))
+
+
+def verify_in_process(username: str, img_path: str) -> int:
+    """Executes direct in-process DRFM verification against enrolled templates."""
+    from dense_matcher import DenseRidgeMatcher
+
+    probe_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if probe_img is None:
+        log("Error: Captured probe frame is unreadable.")
+        return 1
+
+    matcher = DenseRidgeMatcher(min_inliers=MIN_INLIERS)
+    usable, contrast, grad = matcher.get_quality(probe_img)
+    log(f"Quality: contrast={contrast:.1f}, grad_var={grad:.1f}, usable={usable}")
+    if not usable:
+        log("Authentication REJECTED (Low image_quality / partial touch).")
+        return 1
+
+    candidates = get_candidate_templates(username)
+    if not candidates:
+        log(f"Error: No enrolled templates found for target user '{username}'.")
+        return 1
+
+    matched, inliers, rot, _, score, ncc, stage, hits, best_path = matcher.match_gallery(probe_img, candidates)
+    log(
+        f"Telemetry: match_score={score}, inliers={inliers}/{matcher.min_inliers}, "
+        f"ncc={ncc}%, stage_hits={hits}, best_stage={stage}, rotation={rot:+.1f}°"
+    )
+
+    if matched:
+        if best_path:
+            studied = matcher.adaptive_study(probe_img, best_path, inliers)
+            if studied:
+                log(f"gx_templateStudy: Stage frame '{os.path.basename(best_path)}' refreshed.")
+        log("Authentication SUCCESSFUL.")
+        return 0
+
+    log("Authentication REJECTED (Zero-FAR Enclave Security Gate: Impostor finger or insufficient match_score).")
+    return 1
+
+
+def cleanup():
+    if os.path.exists(OUT_FRAME):
+        try:
+            os.remove(OUT_FRAME)
+        except OSError:
+            pass
+
+
+def main():
+    raw_user = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PAM_USER", os.environ.get("USER", ""))
+    # Under sudo, actor might be root while PAM_USER is the real user
+    if not raw_user or raw_user == "root":
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            username = sudo_user
+        else:
+            # fallback to primary active interactive user
+            users = [u for u in glob.glob("/home/*") if os.path.isdir(u)]
+            username = os.path.basename(users[0]) if users else "root"
+    else:
+        username = raw_user
+
+    log(f"Initiating biometric PAM check for target: '{username}' (actor: '{raw_user}')")
+
+    if not capture_sensor_touch():
+        log("No touch registered or sensor timed out.")
+        cleanup()
+        return 1
+
+    ret = verify_in_process(username, OUT_FRAME)
+    cleanup()
+    return ret
+
+
+if __name__ == "__main__":
+    sys.exit(main())

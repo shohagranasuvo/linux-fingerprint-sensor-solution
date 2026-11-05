@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Goodix Fingerprint Suite
+GenericName=Biometric Fingerprint Manager
+Comment=Goodix GM168 DRFM Biometric Suite with Windows Hello Parity
+Exec=/usr/bin/python3 /usr/local/lib/goodix-gm168/fingerprint_gui.py
+Path=/usr/local/lib/goodix-gm168
+Icon=auth-fingerprint
+Terminal=false
+Categories=System;Security;Settings;
+StartupNotify=true
