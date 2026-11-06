@@ -632,15 +632,23 @@ class ModernBiometricApp(Gtk.Application):
         def _worker():
             lsusb = subprocess.run(["lsusb", "-d", "27c6:581a"], capture_output=True, text=True)
             usb_ok = "27c6:581a" in lsusb.stdout
-            psk_ok = os.path.exists(PSK_SYSTEM_PATH) or os.path.exists(PSK_SOURCE_PATH)
+            psk_ok = os.path.exists(PSK_SYSTEM_PATH) or os.path.exists(find_psk_dir())
 
             user = os.environ.get("USER", "shohag-rana")
-            f_list = subprocess.run(["fprintd-list", user], capture_output=True, text=True)
-            enrolled = [
-                l.split(":", 1)[-1].strip() if ":" in l else l[2:].strip()
-                for l in f_list.stdout.splitlines()
-                if l.strip().startswith("-")
+            # Directly inspect local enrolled templates to avoid conflicting fprintd daemon wakeups
+            enrolled = []
+            tmpl_dirs = [
+                TEMPLATES_BASE_DIR,
+                f"/var/lib/goodix-gm168/templates/{user}",
+                "/var/lib/goodix-gm168/templates"
             ]
+            for td in tmpl_dirs:
+                if os.path.isdir(td):
+                    for entry in os.listdir(td):
+                        ep = os.path.join(td, entry)
+                        if os.path.isdir(ep) and (glob.glob(os.path.join(ep, "*.pgm")) or glob.glob(os.path.join(ep, "*", "*.pgm"))):
+                            if entry not in ("root", user) and entry not in enrolled:
+                                enrolled.append(entry)
             self.enrolled_set = set(enrolled)
 
             def _update():
@@ -914,28 +922,36 @@ class ModernBiometricApp(Gtk.Application):
                 if not line:
                     continue
                 self.append_log(line)
-                if "Sensor ready" in line:
-                    self.set_banner("banner-ready", "SENSOR READY: Touch Finger Now", "Place enrolled finger on sensor.")
-                elif "Touch detected" in line:
+                if "Place finger" in line or "ready" in line.lower():
+                    self.set_banner("banner-ready", "SENSOR READY: Touch Finger Now", "Place enrolled finger firmly on the sensor.")
+                elif "Verifying" in line or "Touch detected" in line:
                     self.set_banner("banner-scanning", "TOUCH DETECTED: Analyzing DRFM...", "Matching against enrolled gallery...")
+                elif "recognized" in line or "Authenticated" in line or "SUCCESS" in line:
+                    self.set_banner(
+                        "banner-success",
+                        "🔓 SYSTEM UNLOCKED!",
+                        "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
+                    )
+                    self.set_progress(1, 1, "PAM VERIFIED ✓")
+                elif "timed out" in line:
+                    self.set_banner(
+                        "banner-idle",
+                        "Sensor Timed Out",
+                        "No finger touch registered within acquisition window."
+                    )
+                elif "not recognized" in line or "REJECTED" in line or "unclear" in line:
+                    self.set_banner(
+                        "banner-error",
+                        "❌ AUTHENTICATION FAILED",
+                        "Finger rejected or not recognized. Check finger placement."
+                    )
+                    self.set_progress(0, 1, "ACCESS DENIED ✗")
             self.proc.wait()
 
             if self.proc.returncode == 0:
                 self.append_log("✅ DRFM SYSTEM AUTH SUCCESS: Access GRANTED (Exit 0).")
-                self.set_banner(
-                    "banner-success",
-                    "🔓 SYSTEM UNLOCKED!",
-                    "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
-                )
-                self.set_progress(1, 1, "PAM VERIFIED ✓")
             else:
-                self.append_log("❌ DRFM SYSTEM AUTH DENIED: Finger rejected or timeout (Exit 1).")
-                self.set_banner(
-                    "banner-error",
-                    "❌ AUTHENTICATION FAILED",
-                    "Finger rejected or timed out. Check finger placement."
-                )
-                self.set_progress(0, 1, "ACCESS DENIED ✗")
+                self.append_log(f"❌ DRFM SYSTEM AUTH DENIED (Exit {self.proc.returncode}).")
 
             self.set_busy(False)
 
@@ -947,7 +963,11 @@ class ModernBiometricApp(Gtk.Application):
             return
         shutil.rmtree(os.path.join(TEMPLATES_BASE_DIR, finger), ignore_errors=True)
         user = os.environ.get("USER", "shohag-rana")
-        subprocess.run(["fprintd-delete", user, "-f", finger], capture_output=True, text=True)
+        shutil.rmtree(f"/var/lib/goodix-gm168/templates/{user}/{finger}", ignore_errors=True)
+        try:
+            subprocess.run(["fprintd-delete", user, "-f", finger], capture_output=True, text=True, timeout=2)
+        except Exception:
+            pass
         self.set_banner("banner-idle", f"Deleted {finger}", "Profile cleared.")
         self.refresh_status()
 
@@ -955,7 +975,11 @@ class ModernBiometricApp(Gtk.Application):
         shutil.rmtree(TEMPLATES_BASE_DIR, ignore_errors=True)
         os.makedirs(TEMPLATES_BASE_DIR, exist_ok=True)
         user = os.environ.get("USER", "shohag-rana")
-        subprocess.run(["fprintd-delete", user], capture_output=True, text=True)
+        shutil.rmtree(f"/var/lib/goodix-gm168/templates/{user}", ignore_errors=True)
+        try:
+            subprocess.run(["fprintd-delete", user], capture_output=True, text=True, timeout=2)
+        except Exception:
+            pass
         self.set_banner("banner-idle", "Profiles Cleared", "All enrolled prints deleted.")
         self.refresh_status()
 
