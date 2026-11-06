@@ -46,20 +46,22 @@ fi
 echo "[1/7] Installing system dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq || true
-apt-get install -y -qq \
-    python3 \
-    python3-pip \
-    python3-opencv \
-    python3-numpy \
-    python3-gi \
-    gir1.2-gtk-4.0 \
-    gir1.2-gdkpixbuf-2.0 \
-    libglib2.0-0 \
-    libgusb2 \
-    libpixman-1-0 \
-    libssl3 \
-    libpam-runtime \
-    udev >/dev/null
+
+DEPS=()
+for pkg in python3 python3-pip python3-gi gir1.2-gtk-4.0 gir1.2-gdkpixbuf-2.0 libglib2.0-0 libglib2.0-0t64 libgusb2 libgusb2a libpixman-1-0 libssl3 libssl3t64 libpam-runtime udev; do
+    if apt-cache policy "$pkg" 2>/dev/null | grep -E -q "Candidate:\s+[0-9]"; then
+        DEPS+=("$pkg")
+    fi
+done
+
+if [[ ${#DEPS[@]} -gt 0 ]]; then
+    apt-get install -y -qq "${DEPS[@]}" >/dev/null 2>&1 || apt-get install -y "${DEPS[@]}" || true
+fi
+
+# Ensure opencv and numpy are available
+if ! python3 -c "import cv2, numpy" >/dev/null 2>&1; then
+    apt-get install -y -qq python3-opencv python3-numpy >/dev/null 2>&1 || true
+fi
 
 # 2. Create system directories
 echo "[2/7] Creating system directories..."
@@ -86,6 +88,16 @@ fi
 if ls "${SCRIPT_DIR}/bin"/libfprint-2.so* >/dev/null 2>&1; then
     cp -d "${SCRIPT_DIR}/bin"/libfprint-2.so* /usr/local/lib/goodix-gm168/
 fi
+
+# Ensure clean system Python delegation for OpenCV / NumPy
+rm -rf /usr/local/lib/goodix-gm168/cv2 /usr/local/lib/goodix-gm168/numpy
+for u in /home/*; do
+    for v in python3.14 python3.13 python3.12 python3.11 python3.10; do
+        if [[ -d "$u/.local/lib/$v/site-packages" ]] && [[ -d "/usr/local/lib/$v/dist-packages" ]]; then
+            echo "$u/.local/lib/$v/site-packages" > "/usr/local/lib/$v/dist-packages/goodix-deps.pth" 2>/dev/null || true
+        fi
+    done
+done
 
 # 4. Install udev access rules
 echo "[4/7] Configuring USB udev access permissions..."
@@ -148,7 +160,7 @@ Default: yes
 Priority: 260
 Auth-Type: Primary
 Auth:
-	[success=end default=ignore] pam_exec.so quiet /usr/local/bin/pam_goodix_verify.py
+	[success=end default=ignore] pam_exec.so quiet stdout /usr/local/bin/pam_goodix_verify.py
 EOF
 
 # Disable conflicting fprintd if present and activate goodix-drfm

@@ -22,7 +22,7 @@ Version: ${VERSION}
 Section: admin
 Priority: optional
 Architecture: ${ARCH}
-Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-4.0, libglib2.0-0, libgusb2, libpam-runtime
+Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-4.0, libglib2.0-0 | libglib2.0-0t64, libgusb2 | libgusb2a, libpam-runtime
 Maintainer: Shohag Rana Suvo <shohagranasuvo@gmail.com>
 Description: Goodix GM168 DRFM Linux Biometric Driver & PAM Stack
  Complete Linux driver and Dense Ridge-Flow Matcher (DRFM) biometric engine
@@ -46,6 +46,16 @@ if command -v pam-auth-update >/dev/null 2>&1; then
     pam-auth-update --disable fprintd --package 2>/dev/null || true
     pam-auth-update --enable goodix-drfm --package || true
 fi
+
+# Ensure clean system Python delegation for OpenCV / NumPy
+rm -rf /usr/local/lib/goodix-gm168/cv2 /usr/local/lib/goodix-gm168/numpy
+for u in /home/*; do
+    for v in python3.14 python3.13 python3.12 python3.11 python3.10; do
+        if [ -d "$u/.local/lib/$v/site-packages" ] && [ -d "/usr/local/lib/$v/dist-packages" ]; then
+            echo "$u/.local/lib/$v/site-packages" > "/usr/local/lib/$v/dist-packages/goodix-deps.pth" 2>/dev/null || true
+        fi
+    done
+done
 
 # Add desktop icon for active users
 for user_home in /home/*; do
@@ -92,7 +102,7 @@ Default: yes
 Priority: 260
 Auth-Type: Primary
 Auth:
-	[success=end default=ignore] pam_exec.so quiet /usr/local/bin/pam_goodix_verify.py
+	[success=end default=ignore] pam_exec.so quiet stdout /usr/local/bin/pam_goodix_verify.py
 EOF
 
 # Build package

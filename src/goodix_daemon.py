@@ -5,6 +5,7 @@ Runs as a lightweight background service to provide high-speed (<=45ms)
 DRFM + Adaptive Learning (gx_templateStudy) authentication for PAM, sudo, and lockscreens.
 """
 
+import glob
 import os
 import sys
 
@@ -18,7 +19,6 @@ for user_home in glob.glob("/home/*"):
 if "/usr/local/lib/goodix-gm168" not in sys.path:
     sys.path.insert(0, "/usr/local/lib/goodix-gm168")
 
-import glob
 import socket
 import struct
 import cv2
