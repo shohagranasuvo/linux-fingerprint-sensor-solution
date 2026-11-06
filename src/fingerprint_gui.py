@@ -1019,10 +1019,9 @@ class ModernBiometricApp(Gtk.Application):
         shutil.rmtree(os.path.join(TEMPLATES_BASE_DIR, finger), ignore_errors=True)
         user = os.environ.get("USER", "shohag-rana")
         shutil.rmtree(f"/var/lib/goodix-gm168/templates/{user}/{finger}", ignore_errors=True)
-        try:
-            subprocess.run(["fprintd-delete", user, "-f", finger], capture_output=True, text=True, timeout=2)
-        except Exception:
-            pass
+        shutil.rmtree(f"/var/lib/goodix-gm168/templates/root/{finger}", ignore_errors=True)
+        user_config_dir = os.path.expanduser(f"~/.config/goodix-gm168/templates/{finger}")
+        shutil.rmtree(user_config_dir, ignore_errors=True)
         self.set_banner("banner-idle", f"Deleted {finger}", "Profile cleared.")
         self.refresh_status()
 
@@ -1031,10 +1030,9 @@ class ModernBiometricApp(Gtk.Application):
         os.makedirs(TEMPLATES_BASE_DIR, exist_ok=True)
         user = os.environ.get("USER", "shohag-rana")
         shutil.rmtree(f"/var/lib/goodix-gm168/templates/{user}", ignore_errors=True)
-        try:
-            subprocess.run(["fprintd-delete", user], capture_output=True, text=True, timeout=2)
-        except Exception:
-            pass
+        shutil.rmtree("/var/lib/goodix-gm168/templates/root", ignore_errors=True)
+        user_config_dir = os.path.expanduser("~/.config/goodix-gm168/templates")
+        shutil.rmtree(user_config_dir, ignore_errors=True)
         self.set_banner("banner-idle", "Profiles Cleared", "All enrolled prints deleted.")
         self.refresh_status()
 
