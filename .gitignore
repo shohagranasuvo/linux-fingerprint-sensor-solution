@@ -6,3 +6,4 @@ __pycache__/
 *~
 .DS_Store
 packaging/*.deb_build/
+packaging/goodix-gm168-linux-driver_*
