@@ -18,24 +18,36 @@ import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Universal Python environment bootstrap:
-# Ensures root PAM execution can import user site-packages (cv2, numpy) and local modules
+# Universal Python environment bootstrap for root/sudo PAM context
 SEARCH_PATHS = [
     "/usr/local/lib/goodix-gm168",
     SCRIPT_DIR,
+    "/usr/lib/python3/dist-packages",
+    "/usr/local/lib/python3/dist-packages",
 ]
-# Dynamically add user site-packages for all active home accounts
-for user_home in glob.glob("/home/*"):
-    for py_ver in ["python3.14", "python3.13", "python3.12", "python3.11", "python3.10"]:
-        pkg_dir = os.path.join(user_home, ".local/lib", py_ver, "site-packages")
+for pattern in (
+    "/usr/local/lib/python3*/dist-packages",
+    "/usr/local/lib/python3*/site-packages",
+    "/usr/lib/python3*/dist-packages",
+    "/home/*/.local/lib/python3*/site-packages",
+):
+    for pkg_dir in sorted(glob.glob(pattern), reverse=True):
         if os.path.isdir(pkg_dir) and pkg_dir not in SEARCH_PATHS:
             SEARCH_PATHS.append(pkg_dir)
 
 for p in reversed(SEARCH_PATHS):
-    if os.path.isdir(p) and p not in sys.path:
+    if p not in sys.path:
         sys.path.insert(0, p)
 
-import cv2
+try:
+    import cv2
+    import numpy as np
+except ImportError as exc:
+    # Fallback: re-exec with system /usr/bin/python3 if a custom binary without cv2 was invoked
+    if sys.executable != "/usr/bin/python3" and os.path.exists("/usr/bin/python3"):
+        os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
+    sys.stderr.write(f"PAM Goodix: OpenCV import failed ({exc})\n")
+    sys.exit(1)
 
 SYSTEM_CAPTURE_BIN = "/usr/local/lib/goodix-gm168/img-capture"
 LOCAL_CAPTURE_BIN = os.path.abspath(os.path.join(SCRIPT_DIR, "../bin/img-capture"))

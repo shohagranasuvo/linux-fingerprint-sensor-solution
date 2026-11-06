@@ -712,6 +712,7 @@ class ModernBiometricApp(Gtk.Application):
 
         def _worker():
             candidates = [
+                os.path.expanduser("~/goodix-gm168-linux-driver/install.sh"),
                 os.path.abspath(os.path.join(CURRENT_DIR, "../install.sh")),
                 os.path.join(CURRENT_DIR, "install.sh"),
                 "/usr/local/lib/goodix-gm168/install.sh"
