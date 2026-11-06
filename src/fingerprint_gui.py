@@ -785,49 +785,103 @@ class ModernBiometricApp(Gtk.Application):
         finger = self.finger_combo.get_active_id() or "right-index-finger"
         self.set_busy(True)
         self.set_progress(0, 16, "Initializing...")
-        self.set_active_zone(1)
-        z1 = ZONES[1]
-        self.set_banner("banner-waiting", "Calibrating Sensor...", "Wait 1.2s for baseline.")
+        self.append_log(f"=== Starting Direct DRFM 16-Stage Enrollment for '{finger}' ===")
 
         def _worker():
-            env = os.environ.copy()
-            env.update({"GM168_DUMP_FRAMES": "1", "GM168_DUMP_DIR": "/tmp"})
-            self.proc = subprocess.Popen(["fprintd-enroll", "-f", finger], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            stage = 0
-            time.sleep(1.2)
-            self.set_banner("banner-ready", f"PLACE FINGER: {z1['icon']} {z1['name']}", z1['guide'])
-
             persistent_dir = os.path.join(TEMPLATES_BASE_DIR, finger)
             os.makedirs(persistent_dir, exist_ok=True)
+            user_config_dir = os.path.expanduser(f"~/.config/goodix-gm168/templates/{finger}")
+            os.makedirs(user_config_dir, exist_ok=True)
 
-            for line in self.proc.stdout:
-                line = line.strip()
-                self.append_log(line)
-                if "enroll-stage-passed" in line:
-                    stage += 1
-                    self.set_progress(stage, 16, f"Stage {stage} / 16 Passed ✓")
-                    if stage < 16:
-                        nz = get_zone_for_stage(stage + 1)
-                        self.set_active_zone(nz)
-                        self.set_banner("banner-lift", f"LIFT FINGER (Stage {stage}/16 Passed)", "Lift off the pad.")
-                        time.sleep(0.75)
-                        self.set_banner("banner-ready", f"TOUCH: {ZONES[nz]['icon']} {ZONES[nz]['name']}", ZONES[nz]['guide'])
+            exe = find_capture_bin()
+            if not exe or not os.path.exists(exe):
+                self.append_log(f"❌ img-capture binary not found: {exe}")
+                self.set_banner("banner-error", "Capture Engine Missing", "Deploy driver first.")
+                self.set_busy(False)
+                return
 
-                    candidates = glob.glob("/tmp/gm168_*_fpimg.pgm")
-                    if os.path.exists(PREVIEW_SYSTEM_PATH):
-                        candidates.append(PREVIEW_SYSTEM_PATH)
-                    if candidates:
-                        latest = sorted(candidates, key=os.path.getmtime)[-1]
-                        dest_file = os.path.join(persistent_dir, f"stage_{stage:02d}.pgm")
-                        shutil.copy(latest, dest_file)
+            env = os.environ.copy()
+            env.update({
+                "GOODIX_GM168_DIR": find_psk_dir(),
+                "LD_LIBRARY_PATH": find_lib_dir(),
+                "GM168_DUMP_FRAMES": "1",
+                "GM168_DUMP_DIR": "/tmp"
+            })
 
-                elif "enroll-retry-scan" in line:
-                    self.set_banner("banner-scanning", "RETRY SCAN", "Ensure full coverage and press firmly.")
-                elif "enroll-completed" in line:
-                    self.set_progress(16, 16, "Enrolled 16/16 ✓")
-                    self.set_banner("banner-success", "Enrollment Complete", f"{finger} stored.")
+            TOTAL_STAGES = 16
+            stage = 0
+            while stage < TOTAL_STAGES:
+                current_stage = stage + 1
+                zone_info = ZONES.get(get_zone_for_stage(current_stage), ZONES[1])
+                self.set_active_zone(get_zone_for_stage(current_stage))
+                self.set_progress(stage, TOTAL_STAGES, f"Stage {current_stage}/{TOTAL_STAGES}: {zone_info['name']}")
+                self.set_banner("banner-ready", f"STAGE {current_stage}/{TOTAL_STAGES}: {zone_info['icon']} {zone_info['name']}", f"{zone_info['guide']} (Touch sensor)")
+                self.append_log(f"👉 Stage {current_stage}/{TOTAL_STAGES}: Touch sensor ({zone_info['name']})...")
 
-            self.proc.wait()
+                stage_tmp = f"/tmp/stage_{current_stage:02d}.pgm"
+                if os.path.exists(stage_tmp):
+                    try:
+                        os.remove(stage_tmp)
+                    except Exception:
+                        pass
+
+                self.proc = subprocess.Popen(
+                    ["timeout", "20s", exe, stage_tmp],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env
+                )
+                self.proc.wait()
+
+                # Check if user cancelled
+                if not self.busy:
+                    self.append_log("Enrollment stopped by user.")
+                    return
+
+                if os.path.exists(stage_tmp) and os.path.getsize(stage_tmp) > 1000:
+                    raw = cv2.imread(stage_tmp, cv2.IMREAD_GRAYSCALE)
+                    if raw is not None:
+                        usable, contrast, grad = self.dense_matcher.get_quality(raw)
+                        self.load_preview_image(stage_tmp)
+                        if not usable:
+                            self.append_log(f"⚠️ Low contrast scan (contrast={contrast:.1f}, grad={grad:.1f}). Press firmly and retry stage.")
+                            self.set_banner("banner-scanning", "RETRY SCAN", "Ensure full coverage, press firmly.")
+                            time.sleep(1.0)
+                            continue
+
+                        # Valid scan: store template
+                        dest_file = os.path.join(persistent_dir, f"stage_{current_stage:02d}.pgm")
+                        user_dest_file = os.path.join(user_config_dir, f"stage_{current_stage:02d}.pgm")
+                        shutil.copy(stage_tmp, dest_file)
+                        shutil.copy(stage_tmp, user_dest_file)
+
+                        # Sync to root template gallery as well so sudo/PAM has it
+                        root_tmpl = f"/var/lib/goodix-gm168/templates/root/{finger}/stage_{current_stage:02d}.pgm"
+                        try:
+                            os.makedirs(os.path.dirname(root_tmpl), exist_ok=True)
+                            shutil.copy(stage_tmp, root_tmpl)
+                        except Exception:
+                            pass
+
+                        stage += 1
+                        self.set_progress(stage, TOTAL_STAGES, f"Stage {stage}/{TOTAL_STAGES} Passed ✓")
+                        self.append_log(f"✓ Stage {stage}/{TOTAL_STAGES} enrolled (grad={grad:.1f}).")
+
+                        if stage < TOTAL_STAGES:
+                            self.set_banner("banner-lift", f"LIFT FINGER (Stage {stage}/{TOTAL_STAGES} Passed)", "Lift finger off the pad.")
+                            time.sleep(0.8)
+                    else:
+                        self.append_log("⚠️ Could not decode frame. Retrying...")
+                        time.sleep(1.0)
+                else:
+                    self.append_log(f"⏱️ Stage {current_stage} timed out. Lift and touch again...")
+                    self.set_banner("banner-waiting", "No Touch Registered", "Touch firmly when ready.")
+                    time.sleep(1.0)
+
+            self.set_progress(TOTAL_STAGES, TOTAL_STAGES, "Enrolled 16/16 ✓")
+            self.set_banner("banner-success", "🎉 Enrollment Complete!", f"16 stages enrolled for '{finger}'. DRFM biometric gallery ready.")
+            self.append_log(f"🎉 Successfully enrolled all 16 stages for '{finger}'!")
             self.set_busy(False)
             self.refresh_status()
 

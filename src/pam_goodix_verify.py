@@ -72,8 +72,14 @@ def user_msg(msg: str):
 def debug_log(msg: str):
     """Logs detailed telemetry to /tmp/goodix-pam.log without cluttering the PAM prompt."""
     try:
+        first_time = not os.path.exists(LOG_FILE)
         with open(LOG_FILE, "a") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        if first_time:
+            try:
+                os.chmod(LOG_FILE, 0o666)
+            except Exception:
+                pass
     except Exception:
         pass
 

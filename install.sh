@@ -97,14 +97,26 @@ echo "[3/7] Deploying DRFM modules, capture binaries, and libraries..."
 MOD_SRC="${SRC_ROOT}/src"
 [[ ! -d "$MOD_SRC" ]] && MOD_SRC="$SRC_ROOT"
 
-install -m 755 "${BASH_SOURCE[0]}" /usr/local/lib/goodix-gm168/install.sh
+safe_install() {
+    local mode="$1"
+    local src="$2"
+    local dst="$3"
+    local real_src real_dst
+    real_src="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+    real_dst="$(readlink -f "$dst" 2>/dev/null || echo "$dst")"
+    if [[ "$real_src" != "$real_dst" ]]; then
+        install -m "$mode" "$src" "$dst"
+    fi
+}
+
+safe_install 755 "${BASH_SOURCE[0]}" /usr/local/lib/goodix-gm168/install.sh
 for pyfile in dense_matcher.py goodix_daemon.py fingerprint_gui.py pam_goodix_verify.py; do
     if [[ -f "${MOD_SRC}/${pyfile}" ]]; then
-        install -m 755 "${MOD_SRC}/${pyfile}" "/usr/local/lib/goodix-gm168/${pyfile}"
-        install -m 755 "${MOD_SRC}/${pyfile}" "/usr/local/lib/goodix-gm168/src/${pyfile}"
+        safe_install 755 "${MOD_SRC}/${pyfile}" "/usr/local/lib/goodix-gm168/${pyfile}"
+        safe_install 755 "${MOD_SRC}/${pyfile}" "/usr/local/lib/goodix-gm168/src/${pyfile}"
     fi
 done
-install -m 755 "/usr/local/lib/goodix-gm168/pam_goodix_verify.py" /usr/local/bin/pam_goodix_verify.py
+safe_install 755 "/usr/local/lib/goodix-gm168/pam_goodix_verify.py" /usr/local/bin/pam_goodix_verify.py
 
 cat << 'EOF' > /usr/local/bin/goodix-enroll
 #!/usr/bin/env bash
@@ -112,15 +124,21 @@ exec python3 /usr/local/lib/goodix-gm168/fingerprint_gui.py "$@"
 EOF
 chmod 755 /usr/local/bin/goodix-enroll
 
+touch /tmp/goodix-pam.log && chmod 666 /tmp/goodix-pam.log 2>/dev/null || true
+
 BIN_SRC="${SRC_ROOT}/bin"
 [[ ! -d "$BIN_SRC" ]] && BIN_SRC="$SRC_ROOT"
-if [[ -f "${BIN_SRC}/img-capture" && "${BIN_SRC}/img-capture" != "/usr/local/lib/goodix-gm168/img-capture" ]]; then
-    install -m 755 "${BIN_SRC}/img-capture" /usr/local/lib/goodix-gm168/img-capture
-    install -m 755 "${BIN_SRC}/img-capture" /usr/local/lib/goodix-gm168/bin/img-capture
+if [[ -f "${BIN_SRC}/img-capture" ]]; then
+    safe_install 755 "${BIN_SRC}/img-capture" /usr/local/lib/goodix-gm168/img-capture
+    safe_install 755 "${BIN_SRC}/img-capture" /usr/local/lib/goodix-gm168/bin/img-capture
 fi
 if ls "${BIN_SRC}"/libfprint-2.so* >/dev/null 2>&1; then
-    cp -df "${BIN_SRC}"/libfprint-2.so* /usr/local/lib/goodix-gm168/ 2>/dev/null || true
-    cp -df "${BIN_SRC}"/libfprint-2.so* /usr/local/lib/goodix-gm168/bin/ 2>/dev/null || true
+    if [[ "$(readlink -f "${BIN_SRC}")" != "$(readlink -f /usr/local/lib/goodix-gm168)" ]]; then
+        cp -df "${BIN_SRC}"/libfprint-2.so* /usr/local/lib/goodix-gm168/ 2>/dev/null || true
+    fi
+    if [[ "$(readlink -f "${BIN_SRC}")" != "$(readlink -f /usr/local/lib/goodix-gm168/bin)" ]]; then
+        cp -df "${BIN_SRC}"/libfprint-2.so* /usr/local/lib/goodix-gm168/bin/ 2>/dev/null || true
+    fi
 fi
 
 # Bridge user site-packages (e.g. python3.14 cv2/numpy) into system dist-packages & /usr/local/lib/goodix-gm168
