@@ -617,16 +617,19 @@ class ModernBiometricApp(Gtk.Application):
         GLib.timeout_add(250, _poll)
 
     def load_preview_image(self, pgm_path: str):
-        raw = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
-        if raw is None:
-            return
-        enh = self.dense_matcher.preprocess(raw)
-        kp, _ = self.dense_matcher.orb.detectAndCompute(enh, None)
-        vis = cv2.cvtColor(enh, cv2.COLOR_GRAY2BGR)
-        for k in (kp or []):
-            cv2.circle(vis, (int(round(k.pt[0])), int(round(k.pt[1]))), 2, (0, 255, 64), 1)
-        self.display_numpy_image(vis)
-        GLib.idle_add(lambda: self.metric_kps_lbl.set_text(f"Dense Features: {len(kp) if kp else 0}") or False)
+        try:
+            raw = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
+            if raw is None:
+                return
+            enh, mask = self.dense_matcher.preprocess(raw)
+            kp, _ = self.dense_matcher.orb.detectAndCompute(enh, mask)
+            vis = cv2.cvtColor(enh, cv2.COLOR_GRAY2BGR)
+            for k in (kp or []):
+                cv2.circle(vis, (int(round(k.pt[0])), int(round(k.pt[1]))), 2, (0, 255, 64), 1)
+            self.display_numpy_image(vis)
+            GLib.idle_add(lambda: self.metric_kps_lbl.set_text(f"Dense Features: {len(kp) if kp else 0}") or False)
+        except Exception as e:
+            pass
 
     def refresh_status(self):
         def _worker():
@@ -839,28 +842,45 @@ class ModernBiometricApp(Gtk.Application):
                     self.append_log("Enrollment stopped by user.")
                     return
 
+                captured_file = None
                 if os.path.exists(stage_tmp) and os.path.getsize(stage_tmp) > 1000:
-                    raw = cv2.imread(stage_tmp, cv2.IMREAD_GRAYSCALE)
+                    captured_file = stage_tmp
+                else:
+                    # Fallback to driver preview dump
+                    candidates = glob.glob("/tmp/gm168_*_fpimg.pgm")
+                    if os.path.exists(PREVIEW_TMP_PATH):
+                        candidates.append(PREVIEW_TMP_PATH)
+                    if candidates:
+                        latest = sorted(candidates, key=os.path.getmtime)[-1]
+                        if os.path.getsize(latest) > 1000 and (time.time() - os.path.getmtime(latest)) < 25:
+                            captured_file = latest
+
+                if captured_file:
+                    raw = cv2.imread(captured_file, cv2.IMREAD_GRAYSCALE)
                     if raw is not None:
                         usable, contrast, grad = self.dense_matcher.get_quality(raw)
-                        self.load_preview_image(stage_tmp)
+                        try:
+                            self.load_preview_image(captured_file)
+                        except Exception:
+                            pass
+
                         if not usable:
                             self.append_log(f"⚠️ Low contrast scan (contrast={contrast:.1f}, grad={grad:.1f}). Press firmly and retry stage.")
                             self.set_banner("banner-scanning", "RETRY SCAN", "Ensure full coverage, press firmly.")
-                            time.sleep(1.0)
+                            time.sleep(1.2)
                             continue
 
                         # Valid scan: store template
                         dest_file = os.path.join(persistent_dir, f"stage_{current_stage:02d}.pgm")
                         user_dest_file = os.path.join(user_config_dir, f"stage_{current_stage:02d}.pgm")
-                        shutil.copy(stage_tmp, dest_file)
-                        shutil.copy(stage_tmp, user_dest_file)
+                        shutil.copy(captured_file, dest_file)
+                        shutil.copy(captured_file, user_dest_file)
 
                         # Sync to root template gallery as well so sudo/PAM has it
-                        root_tmpl = f"/var/lib/goodix-gm168/templates/root/{finger}/stage_{current_stage:02d}.pgm"
                         try:
+                            root_tmpl = f"/var/lib/goodix-gm168/templates/root/{finger}/stage_{current_stage:02d}.pgm"
                             os.makedirs(os.path.dirname(root_tmpl), exist_ok=True)
-                            shutil.copy(stage_tmp, root_tmpl)
+                            shutil.copy(captured_file, root_tmpl)
                         except Exception:
                             pass
 
@@ -869,15 +889,15 @@ class ModernBiometricApp(Gtk.Application):
                         self.append_log(f"✓ Stage {stage}/{TOTAL_STAGES} enrolled (grad={grad:.1f}).")
 
                         if stage < TOTAL_STAGES:
-                            self.set_banner("banner-lift", f"LIFT FINGER (Stage {stage}/{TOTAL_STAGES} Passed)", "Lift finger off the pad.")
-                            time.sleep(0.8)
+                            self.set_banner("banner-lift", f"LIFT FINGER (Stage {stage}/{TOTAL_STAGES} Passed)", "Lift your finger completely off the pad...")
+                            time.sleep(1.2)
                     else:
                         self.append_log("⚠️ Could not decode frame. Retrying...")
-                        time.sleep(1.0)
+                        time.sleep(1.2)
                 else:
                     self.append_log(f"⏱️ Stage {current_stage} timed out. Lift and touch again...")
                     self.set_banner("banner-waiting", "No Touch Registered", "Touch firmly when ready.")
-                    time.sleep(1.0)
+                    time.sleep(1.2)
 
             self.set_progress(TOTAL_STAGES, TOTAL_STAGES, "Enrolled 16/16 ✓")
             self.set_banner("banner-success", "🎉 Enrollment Complete!", f"16 stages enrolled for '{finger}'. DRFM biometric gallery ready.")
