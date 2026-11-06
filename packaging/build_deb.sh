@@ -42,6 +42,14 @@ chmod 755 /usr/local/lib/goodix-gm168/img-capture 2>/dev/null || true
 udevadm control --reload-rules || true
 udevadm trigger || true
 
+systemctl stop fprintd.service 2>/dev/null || true
+systemctl disable fprintd.service 2>/dev/null || true
+systemctl mask fprintd.service 2>/dev/null || true
+
+if [ -f /etc/pam.d/gdm-fingerprint ]; then
+    sed -i 's/^auth\s\+required\s\+pam_fprintd\.so/# auth required pam_fprintd.so (disabled for goodix-drfm)/g' /etc/pam.d/gdm-fingerprint 2>/dev/null || true
+fi
+
 if command -v pam-auth-update >/dev/null 2>&1; then
     pam-auth-update --disable fprintd --package 2>/dev/null || true
     pam-auth-update --enable goodix-drfm --package || true

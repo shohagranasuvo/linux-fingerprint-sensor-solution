@@ -163,6 +163,17 @@ Auth:
 	[success=end default=ignore] pam_exec.so quiet stdout /usr/local/bin/pam_goodix_verify.py
 EOF
 
+# Disable and mask conflicting fprintd daemon and its D-Bus activation
+echo "   Disabling and masking conflicting fprintd..."
+systemctl stop fprintd.service 2>/dev/null || true
+systemctl disable fprintd.service 2>/dev/null || true
+systemctl mask fprintd.service 2>/dev/null || true
+
+# Disable conflicting pam_fprintd in GDM if present
+if [[ -f /etc/pam.d/gdm-fingerprint ]]; then
+    sed -i 's/^auth\s\+required\s\+pam_fprintd\.so/# auth required pam_fprintd.so (disabled for goodix-drfm)/g' /etc/pam.d/gdm-fingerprint 2>/dev/null || true
+fi
+
 # Disable conflicting fprintd if present and activate goodix-drfm
 pam-auth-update --disable fprintd --package 2>/dev/null || true
 pam-auth-update --enable goodix-drfm --package

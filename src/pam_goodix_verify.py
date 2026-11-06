@@ -8,6 +8,7 @@ Invoked by pam_exec.so during sudo, lockscreen, and GDM login.
 Exits 0 on match, 1 on failure.
 """
 
+import fcntl
 import glob
 import os
 import pwd
@@ -47,6 +48,7 @@ LIB_DIR = SYSTEM_LIB_DIR if os.path.exists(os.path.join(SYSTEM_LIB_DIR, "libfpri
 OUT_FRAME = "/tmp/pam_probe.pgm"
 MIN_INLIERS = 10
 LOG_FILE = "/tmp/goodix-pam.log"
+LOCK_FILE = "/run/goodix_sensor.lock"
 
 
 def user_msg(msg: str):
@@ -67,10 +69,9 @@ def debug_log(msg: str):
 def ensure_fprintd_stopped():
     """Prevents USB device contention with conflicting background fprintd service."""
     try:
-        chk = subprocess.run(["systemctl", "is-active", "fprintd"], capture_output=True, text=True)
-        if chk.stdout.strip() == "active":
-            debug_log("Stopping conflicting fprintd service before sensor arm...")
-            subprocess.run(["systemctl", "stop", "fprintd"], capture_output=True, timeout=2)
+        # If running as root, stop and mask fprintd permanently so D-Bus won't restart it
+        subprocess.run(["systemctl", "stop", "fprintd.service"], capture_output=True, timeout=2)
+        subprocess.run(["systemctl", "mask", "fprintd.service"], capture_output=True, timeout=2)
     except Exception:
         pass
 
@@ -91,62 +92,105 @@ def get_psk_directory() -> str:
     return "/etc/goodix-gm168"
 
 
-def capture_sensor_touch() -> bool:
-    """Arms the sensor and captures a live touch frame."""
+def _exec_single_capture(env: dict, timeout_sec: int = 15) -> tuple:
+    """Executes single img-capture process and streams output."""
     if os.path.exists(OUT_FRAME):
         try:
             os.remove(OUT_FRAME)
         except OSError:
             pass
 
+    proc = subprocess.Popen(
+        ["timeout", f"{timeout_sec}s", CAPTURE_BIN, OUT_FRAME],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+    touch_signaled = False
+    for line in proc.stdout:
+        line_str = line.strip()
+        debug_log(f"img-capture: {line_str}")
+        if ("Touch Detected" in line_str or "touch detected" in line_str.lower()) and not touch_signaled:
+            user_msg("⚡ Verifying fingerprint...")
+            touch_signaled = True
+
+    proc.wait()
+    success = os.path.exists(OUT_FRAME) and os.path.getsize(OUT_FRAME) > 1000
+    return success, proc.returncode
+
+
+def capture_sensor_touch() -> bool:
+    """Arms the sensor and captures a live touch frame with hardware mutex and auto-retry."""
+    # Ensure background fprintd cannot contend for USB
     ensure_fprintd_stopped()
 
-    psk_dir = get_psk_directory()
-    ld_paths = [p for p in [LIB_DIR, SYSTEM_LIB_DIR, LOCAL_LIB_DIR] if os.path.isdir(p)]
-
-    env = os.environ.copy()
-    env.update({
-        "GOODIX_GM168_DIR": psk_dir,
-        "LD_LIBRARY_PATH": ":".join(ld_paths),
-        "GM168_DUMP_FRAMES": "0"
-    })
-
-    user_msg("👆 Place finger on sensor to unlock...")
-    debug_log(f"Arming sensor with CAPTURE_BIN={CAPTURE_BIN}, PSK={psk_dir}...")
+    # Hardware concurrency lock: prevent multiple PAM workers (e.g. GDM workers) from colliding on USB
+    lock_fd = None
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        # Wait up to 2 seconds for any existing capture to release
+        start_wait = time.time()
+        locked = False
+        while time.time() - start_wait < 2.0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except (IOError, OSError):
+                time.sleep(0.1)
+        if not locked:
+            debug_log("Sensor busy: another auth worker currently holds lock.")
+            return False
+    except Exception as e:
+        debug_log(f"Lock warning: {e}")
 
     try:
-        proc = subprocess.Popen(
-            ["timeout", "15s", CAPTURE_BIN, OUT_FRAME],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        touch_signaled = False
-        for line in proc.stdout:
-            line_str = line.strip()
-            debug_log(f"img-capture: {line_str}")
-            if ("Touch Detected" in line_str or "touch detected" in line_str.lower()) and not touch_signaled:
-                user_msg("⚡ Verifying fingerprint...")
-                touch_signaled = True
+        psk_dir = get_psk_directory()
+        ld_paths = [p for p in [LIB_DIR, SYSTEM_LIB_DIR, LOCAL_LIB_DIR] if os.path.isdir(p)]
 
-        proc.wait()
+        env = os.environ.copy()
+        env.update({
+            "GOODIX_GM168_DIR": psk_dir,
+            "LD_LIBRARY_PATH": ":".join(ld_paths),
+            "GM168_DUMP_FRAMES": "0"
+        })
 
-        if os.path.exists(OUT_FRAME) and os.path.getsize(OUT_FRAME) > 1000:
+        user_msg("👆 Place finger on sensor to unlock...")
+        debug_log(f"Arming sensor with CAPTURE_BIN={CAPTURE_BIN}, PSK={psk_dir}...")
+
+        success, retcode = _exec_single_capture(env, timeout_sec=15)
+        if success:
             debug_log(f"Probe frame captured successfully ({os.path.getsize(OUT_FRAME)} bytes).")
             return True
 
-        if proc.returncode == 124:
+        # If process exited with error (e.g. transient TLS / USB collision from prior wake), retry once
+        if retcode == 1:
+            debug_log("Capture attempt 1 encountered USB/TLS glitch. Retrying after brief settle...")
+            time.sleep(0.2)
+            success, retcode = _exec_single_capture(env, timeout_sec=10)
+            if success:
+                debug_log(f"Probe frame captured on retry ({os.path.getsize(OUT_FRAME)} bytes).")
+                return True
+
+        if retcode == 124:
             user_msg("⏱️ Fingerprint sensor timed out.")
-            debug_log("Sensor acquisition timed out after 15s.")
+            debug_log("Sensor acquisition timed out.")
         else:
             user_msg("⏱️ Fingerprint sensor timed out.")
-            debug_log(f"Sensor acquisition ended without valid frame (exit={proc.returncode}).")
+            debug_log(f"Sensor acquisition ended without valid frame (exit={retcode}).")
         return False
     except Exception as e:
         debug_log(f"Capture error exception: {e}")
         user_msg("⏱️ Fingerprint sensor timed out.")
         return False
+    finally:
+        if lock_fd:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
 
 
 def get_candidate_templates(target_user: str) -> list:
