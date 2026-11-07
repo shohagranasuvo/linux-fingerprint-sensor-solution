@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PACKAGE_NAME="goodix-gm168-linux-driver"
-VERSION="1.0.0"
+VERSION="1.1.0"
 ARCH="amd64"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/packaging/${PACKAGE_NAME}_${VERSION}_${ARCH}"
@@ -22,14 +22,14 @@ Version: ${VERSION}
 Section: admin
 Priority: optional
 Architecture: ${ARCH}
-Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-4.0, libglib2.0-0 | libglib2.0-0t64, libgusb2 | libgusb2a, libpam-runtime
+Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-4.0, libglib2.0-0 | libglib2.0-0t64, libgusb2 | libgusb2t64 | libgusb2a, libssl3 | libssl3t64, libpam-runtime
 Maintainer: Shohag Rana Suvo <shohagranasuvo@gmail.com>
 Description: Goodix GM168 DRFM Linux Biometric Driver & PAM Stack
  Complete Linux driver and Dense Ridge-Flow Matcher (DRFM) biometric engine
  for Goodix GM168 (27c6:581a, 27c6:589a) fingerprint sensors found in
  Xiaomi RedmiBook Pro 14S, RedmiBook Pro 15, and Mi NoteBook Ultra laptops.
  Includes Windows Hello Enclave parity, PAM system authentication (sudo, GDM,
- lockscreen), and a GTK3 management suite.
+ lockscreen), and a GTK4 management suite.
 EOF
 
 # 2. Post-installation hook
@@ -99,6 +99,13 @@ install -m 755 "${ROOT_DIR}/src/goodix_daemon.py" "${BUILD_DIR}/usr/local/lib/go
 install -m 755 "${ROOT_DIR}/src/fingerprint_gui.py" "${BUILD_DIR}/usr/local/lib/goodix-gm168/"
 install -m 755 "${ROOT_DIR}/src/pam_goodix_verify.py" "${BUILD_DIR}/usr/local/lib/goodix-gm168/"
 install -m 755 "${ROOT_DIR}/src/pam_goodix_verify.py" "${BUILD_DIR}/usr/local/bin/"
+cat << 'EOF' > "${BUILD_DIR}/usr/local/bin/goodix-enroll"
+#!/usr/bin/env bash
+exec /usr/bin/python3 /usr/local/lib/goodix-gm168/fingerprint_gui.py "$@"
+EOF
+chmod 755 "${BUILD_DIR}/usr/local/bin/goodix-enroll"
+
+install -m 755 "${ROOT_DIR}/uninstall.sh" "${BUILD_DIR}/usr/local/lib/goodix-gm168/"
 install -m 755 "${ROOT_DIR}/bin/img-capture" "${BUILD_DIR}/usr/local/lib/goodix-gm168/"
 cp -d "${ROOT_DIR}/bin"/libfprint-2.so* "${BUILD_DIR}/usr/local/lib/goodix-gm168/"
 install -m 644 "${ROOT_DIR}/udev/60-goodix-gm168.rules" "${BUILD_DIR}/etc/udev/rules.d/"
