@@ -4,6 +4,7 @@ Goodix GM168 (27c6:581a) Biometric Suite
 Dedicated Engine: Dense Ridge-Flow Matcher (DRFM) + Adaptive Template Study (gx_templateStudy)
 """
 
+import fcntl
 import glob
 import os
 import shutil
@@ -57,6 +58,64 @@ def find_lib_dir() -> str:
     return os.path.join(CURRENT_DIR, "libfprint/build/libfprint")
 
 
+def ensure_fprintd_stopped():
+    """Prevents USB device contention with conflicting background fprintd service."""
+    try:
+        subprocess.run(["systemctl", "stop", "fprintd.service"], capture_output=True, timeout=2)
+        subprocess.run(["systemctl", "mask", "fprintd.service"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+
+def acquire_sensor_lock(timeout_sec: float = 3.0):
+    """Acquires exclusive hardware lock to prevent USB contention with PAM or daemon workers."""
+    for lock_path in ("/run/goodix_sensor.lock", "/tmp/goodix_sensor.lock"):
+        lock_fd = None
+        try:
+            lock_fd = open(lock_path, "w")
+            try:
+                os.chmod(lock_path, 0o666)
+            except Exception:
+                pass
+            start_wait = time.time()
+            while time.time() - start_wait < timeout_sec:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return lock_fd
+                except (IOError, OSError):
+                    time.sleep(0.1)
+            lock_fd.close()
+            return None
+        except PermissionError:
+            if lock_fd:
+                try:
+                    lock_fd.close()
+                except Exception:
+                    pass
+            continue
+        except Exception:
+            if lock_fd:
+                try:
+                    lock_fd.close()
+                except Exception:
+                    pass
+            return None
+    return None
+
+
+def release_sensor_lock(lock_fd):
+    """Safely unlocks and closes the hardware lock file descriptor."""
+    if lock_fd:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
+
+
 PSK_SYSTEM_PATH = "/etc/goodix-gm168/psk.bin"
 PREVIEW_SYSTEM_PATH = "/etc/goodix-gm168/preview.pgm"
 PREVIEW_TMP_PATH = "/tmp/gm168_latest_preview.pgm"
@@ -83,7 +142,7 @@ ZONES = {
 }
 
 
-def get_zone_for_stage(stage_1_based):
+def get_zone_for_stage(stage_1_based: int) -> int:
     return (stage_1_based - 1) // 4 + 1 if stage_1_based <= 16 else 4
 
 
@@ -92,6 +151,8 @@ class ModernBiometricApp(Gtk.Application):
         super().__init__(application_id="com.goodix.gm168.biometric")
         self.win = None
         self.proc = None
+        self.busy = False
+        self.suppress_preview_poll = False
         self.last_preview_mtime = 0
         self.last_preview_file = ""
         self.enrolled_set = set()
@@ -565,7 +626,9 @@ class ModernBiometricApp(Gtk.Application):
             return False
         GLib.idle_add(_do)
 
-    def set_busy(self, busy):
+    def set_busy(self, busy: bool):
+        self.busy = bool(busy)
+
         def _do():
             self.install_btn.set_sensitive(not busy)
             self.test_btn.set_sensitive(not busy)
@@ -593,6 +656,8 @@ class ModernBiometricApp(Gtk.Application):
 
     def start_preview_file_watcher(self):
         def _poll():
+            if self.suppress_preview_poll:
+                return True
             candidates = [PREVIEW_SYSTEM_PATH, PREVIEW_TMP_PATH, "/tmp/finger_live_capture.pgm"]
             latest_pgms = sorted(glob.glob("/tmp/gm168_*_fpimg.pgm"), key=os.path.getmtime)
             if latest_pgms:
@@ -628,17 +693,16 @@ class ModernBiometricApp(Gtk.Application):
                 cv2.circle(vis, (int(round(k.pt[0])), int(round(k.pt[1]))), 2, (0, 255, 64), 1)
             self.display_numpy_image(vis)
             GLib.idle_add(lambda: self.metric_kps_lbl.set_text(f"Dense Features: {len(kp) if kp else 0}") or False)
-        except Exception as e:
+        except Exception:
             pass
 
     def refresh_status(self):
         def _worker():
             lsusb = subprocess.run(["lsusb", "-d", "27c6:581a"], capture_output=True, text=True)
             usb_ok = "27c6:581a" in lsusb.stdout
-            psk_ok = os.path.exists(PSK_SYSTEM_PATH) or os.path.exists(find_psk_dir())
+            psk_ok = os.path.exists(PSK_SYSTEM_PATH) or os.path.exists(os.path.join(find_psk_dir(), "psk.bin"))
 
             user = os.environ.get("USER", "shohag-rana")
-            # Directly inspect local enrolled templates to avoid conflicting fprintd daemon wakeups
             enrolled = []
             tmpl_dirs = [
                 TEMPLATES_BASE_DIR,
@@ -696,9 +760,14 @@ class ModernBiometricApp(Gtk.Application):
         self.append_log(f"⚙️ DRFM threshold calibrated to {val} inliers.")
 
     def on_stop(self, _btn):
+        self.busy = False
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
             except Exception:
                 pass
         self.set_banner("banner-idle", "Action Cancelled", "Standby.")
@@ -729,8 +798,9 @@ class ModernBiometricApp(Gtk.Application):
                 stderr=subprocess.STDOUT,
                 text=True
             )
-            for line in proc.stdout:
+            for line in iter(proc.stdout.readline, ""):
                 self.append_log(line.strip())
+            proc.stdout.close()
             proc.wait()
 
             if proc.returncode == 0:
@@ -753,161 +823,280 @@ class ModernBiometricApp(Gtk.Application):
         threading.Thread(target=_worker, daemon=True).start()
 
     def on_test_touch(self, _btn):
+        if self.busy:
+            return
         self.set_busy(True)
         self.set_banner("banner-ready", "TOUCH SENSOR NOW", "Testing capacitive frame capture (20s)...")
 
         def _worker():
-            env = os.environ.copy()
-            env.update({
-                "GOODIX_GM168_DIR": find_psk_dir(),
-                "LD_LIBRARY_PATH": find_lib_dir(),
-                "GM168_DUMP_FRAMES": "1",
-                "GM168_DUMP_DIR": "/tmp"
-            })
-            exe = find_capture_bin()
-            out_pgm = "/tmp/finger_live_capture.pgm"
-            if os.path.exists(out_pgm):
-                os.remove(out_pgm)
+            ensure_fprintd_stopped()
+            lock_fd = acquire_sensor_lock()
+            if not lock_fd:
+                self.append_log("⚠️ Sensor busy: another biometric worker holds the hardware lock.")
+                self.set_banner("banner-error", "Sensor Busy", "Another auth process is running.")
+                self.set_busy(False)
+                return
 
-            self.proc = subprocess.Popen(["timeout", "20s", exe, out_pgm], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            self.proc.wait()
+            try:
+                psk_dir = find_psk_dir()
+                ld_dir = find_lib_dir()
+                ld_paths = [p for p in [ld_dir, "/usr/local/lib/goodix-gm168"] if os.path.isdir(p)]
+                env = os.environ.copy()
+                env.update({
+                    "GOODIX_GM168_DIR": psk_dir,
+                    "LD_LIBRARY_PATH": ":".join(ld_paths),
+                    "GM168_DUMP_FRAMES": "0"
+                })
+                exe = find_capture_bin()
+                out_pgm = "/tmp/finger_live_capture.pgm"
+                if os.path.exists(out_pgm):
+                    try:
+                        os.remove(out_pgm)
+                    except OSError:
+                        pass
 
-            if os.path.exists(out_pgm):
-                raw = cv2.imread(out_pgm, cv2.IMREAD_GRAYSCALE)
-                usable, contrast, grad = self.dense_matcher.get_quality(raw)
-                self.append_log(f"Capture Quality: usable={usable}, contrast={contrast:.1f}, grad_var={grad:.1f}")
-                self.load_preview_image(out_pgm)
-                self.set_banner("banner-idle", "Sensor Frame Captured", f"Quality: {'Usable ✓' if usable else 'Low Contrast ✗'} (Grad: {grad:.1f})")
-            else:
-                self.set_banner("banner-idle", "Test Ended", "No contact registered.")
-            self.set_busy(False)
+                self.proc = subprocess.Popen(
+                    ["timeout", "20s", exe, out_pgm],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env
+                )
+                for line in iter(self.proc.stdout.readline, ""):
+                    line_str = line.strip()
+                    if line_str:
+                        self.append_log(f"[PREVIEW] {line_str}")
+                self.proc.stdout.close()
+                self.proc.wait()
+
+                if os.path.exists(out_pgm) and os.path.getsize(out_pgm) > 1000:
+                    raw = cv2.imread(out_pgm, cv2.IMREAD_GRAYSCALE)
+                    usable, contrast, grad = self.dense_matcher.get_quality(raw)
+                    self.append_log(f"Capture Quality: usable={usable}, contrast={contrast:.1f}, grad_var={grad:.1f}")
+                    self.load_preview_image(out_pgm)
+                    self.set_banner(
+                        "banner-success" if usable else "banner-idle",
+                        "Sensor Frame Captured",
+                        f"Quality: {'Usable ✓' if usable else 'Low Contrast ✗'} (Grad: {grad:.1f})"
+                    )
+                else:
+                    self.set_banner("banner-idle", "Test Ended", "No contact registered.")
+            except Exception as e:
+                self.append_log(f"Preview error: {e}")
+                self.set_banner("banner-error", "Preview Error", str(e))
+            finally:
+                self.proc = None
+                release_sensor_lock(lock_fd)
+                self.set_busy(False)
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def on_enroll(self, _btn):
+        if self.busy:
+            return
+        self.suppress_preview_poll = True
         finger = self.finger_combo.get_active_id() or "right-index-finger"
+
         self.set_busy(True)
         self.set_progress(0, 16, "Initializing...")
+        self.set_active_zone(1)
+        self.set_banner(
+            "banner-waiting",
+            f"Preparing 16-Stage Enrollment ({finger})",
+            "Keep finger OFF sensor during initial baseline calibration..."
+        )
         self.append_log(f"=== Starting Direct DRFM 16-Stage Enrollment for '{finger}' ===")
 
         def _worker():
-            persistent_dir = os.path.join(TEMPLATES_BASE_DIR, finger)
-            os.makedirs(persistent_dir, exist_ok=True)
-            user_config_dir = os.path.expanduser(f"~/.config/goodix-gm168/templates/{finger}")
-            os.makedirs(user_config_dir, exist_ok=True)
+            ensure_fprintd_stopped()
+            try:
+                persistent_dir = os.path.join(TEMPLATES_BASE_DIR, finger)
+                os.makedirs(persistent_dir, exist_ok=True)
 
-            exe = find_capture_bin()
-            if not exe or not os.path.exists(exe):
-                self.append_log(f"❌ img-capture binary not found: {exe}")
-                self.set_banner("banner-error", "Capture Engine Missing", "Deploy driver first.")
-                self.set_busy(False)
-                return
-
-            env = os.environ.copy()
-            env.update({
-                "GOODIX_GM168_DIR": find_psk_dir(),
-                "LD_LIBRARY_PATH": find_lib_dir(),
-                "GM168_DUMP_FRAMES": "1",
-                "GM168_DUMP_DIR": "/tmp"
-            })
-
-            TOTAL_STAGES = 16
-            stage = 0
-            while stage < TOTAL_STAGES:
-                current_stage = stage + 1
-                zone_info = ZONES.get(get_zone_for_stage(current_stage), ZONES[1])
-                self.set_active_zone(get_zone_for_stage(current_stage))
-                self.set_progress(stage, TOTAL_STAGES, f"Stage {current_stage}/{TOTAL_STAGES}: {zone_info['name']}")
-                self.set_banner("banner-ready", f"STAGE {current_stage}/{TOTAL_STAGES}: {zone_info['icon']} {zone_info['name']}", f"{zone_info['guide']} (Touch sensor)")
-                self.append_log(f"👉 Stage {current_stage}/{TOTAL_STAGES}: Touch sensor ({zone_info['name']})...")
-
-                stage_tmp = f"/tmp/stage_{current_stage:02d}.pgm"
-                if os.path.exists(stage_tmp):
-                    try:
-                        os.remove(stage_tmp)
-                    except Exception:
-                        pass
-
-                self.proc = subprocess.Popen(
-                    ["timeout", "20s", exe, stage_tmp],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    env=env
-                )
-                self.proc.wait()
-
-                # Check if user cancelled
-                if not self.busy:
-                    self.append_log("Enrollment stopped by user.")
+                exe = find_capture_bin()
+                if not exe or not os.path.exists(exe):
+                    self.append_log(f"❌ img-capture binary not found: {exe}")
+                    self.set_banner("banner-error", "Capture Engine Missing", "Deploy driver first.")
                     return
 
-                captured_file = None
-                if os.path.exists(stage_tmp) and os.path.getsize(stage_tmp) > 1000:
-                    captured_file = stage_tmp
-                else:
-                    # Fallback to driver preview dump
-                    candidates = glob.glob("/tmp/gm168_*_fpimg.pgm")
-                    if os.path.exists(PREVIEW_TMP_PATH):
-                        candidates.append(PREVIEW_TMP_PATH)
-                    if candidates:
-                        latest = sorted(candidates, key=os.path.getmtime)[-1]
-                        if os.path.getsize(latest) > 1000 and (time.time() - os.path.getmtime(latest)) < 25:
-                            captured_file = latest
+                psk_dir = find_psk_dir()
+                ld_dir = find_lib_dir()
+                ld_paths = [p for p in [ld_dir, "/usr/local/lib/goodix-gm168"] if os.path.isdir(p)]
 
-                if captured_file:
-                    raw = cv2.imread(captured_file, cv2.IMREAD_GRAYSCALE)
-                    if raw is not None:
-                        usable, contrast, grad = self.dense_matcher.get_quality(raw)
+                env = os.environ.copy()
+                env.update({
+                    "GOODIX_GM168_DIR": psk_dir,
+                    "LD_LIBRARY_PATH": ":".join(ld_paths),
+                    "GM168_DUMP_FRAMES": "0"
+                })
+
+                TOTAL_STAGES = 16
+                stage = 0
+
+                while stage < TOTAL_STAGES and self.busy:
+                    current_stage = stage + 1
+                    zone_id = get_zone_for_stage(current_stage)
+                    zone_info = ZONES.get(zone_id, ZONES[1])
+                    self.set_active_zone(zone_id)
+                    self.set_progress(stage, TOTAL_STAGES, f"Stage {current_stage}/{TOTAL_STAGES}: {zone_info['name']}")
+                    self.set_banner(
+                        "banner-ready",
+                        f"STAGE {current_stage}/{TOTAL_STAGES}: {zone_info['icon']} {zone_info['name']}",
+                        f"{zone_info['guide']} (Touch sensor firmly)"
+                    )
+                    self.append_log(f"👉 Stage {current_stage}/{TOTAL_STAGES}: Touch sensor ({zone_info['name']})...")
+
+                    stage_tmp = f"/tmp/stage_{current_stage:02d}.pgm"
+                    if os.path.exists(stage_tmp):
                         try:
-                            self.load_preview_image(captured_file)
-                        except Exception:
+                            os.remove(stage_tmp)
+                        except OSError:
                             pass
 
-                        if not usable:
-                            self.append_log(f"⚠️ Low contrast scan (contrast={contrast:.1f}, grad={grad:.1f}). Press firmly and retry stage.")
-                            self.set_banner("banner-scanning", "RETRY SCAN", "Ensure full coverage, press firmly.")
-                            time.sleep(1.2)
-                            continue
+                    lock_fd = acquire_sensor_lock(timeout_sec=3.0)
+                    if not lock_fd:
+                        self.append_log("⚠️ Sensor busy: waiting for hardware lock...")
+                        self.set_banner("banner-waiting", "Sensor Busy", "Waiting for hardware lock release...")
+                        time.sleep(1.0)
+                        continue
 
-                        # Valid scan: store template
-                        dest_file = os.path.join(persistent_dir, f"stage_{current_stage:02d}.pgm")
-                        user_dest_file = os.path.join(user_config_dir, f"stage_{current_stage:02d}.pgm")
-                        shutil.copy(captured_file, dest_file)
-                        shutil.copy(captured_file, user_dest_file)
+                    rc = -1
+                    try:
+                        self.proc = subprocess.Popen(
+                            ["timeout", "20s", exe, stage_tmp],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=env
+                        )
 
-                        # Sync to root template gallery as well so sudo/PAM has it
-                        try:
-                            root_tmpl = f"/var/lib/goodix-gm168/templates/root/{finger}/stage_{current_stage:02d}.pgm"
-                            os.makedirs(os.path.dirname(root_tmpl), exist_ok=True)
-                            shutil.copy(captured_file, root_tmpl)
-                        except Exception:
-                            pass
+                        for line in iter(self.proc.stdout.readline, ""):
+                            line_str = line.strip()
+                            if not line_str:
+                                continue
+                            self.append_log(f"[STAGE {current_stage:02d}] {line_str}")
+                            if "Touch Detected" in line_str or "touch detected" in line_str.lower():
+                                self.set_banner(
+                                    "banner-scanning",
+                                    f"STAGE {current_stage}/{TOTAL_STAGES}: TOUCH DETECTED",
+                                    "Hold finger steady while capturing ridge frame..."
+                                )
+                            elif "Place" in line_str or "Waiting" in line_str:
+                                self.set_banner(
+                                    "banner-ready",
+                                    f"STAGE {current_stage}/{TOTAL_STAGES}: {zone_info['icon']} {zone_info['name']}",
+                                    f"{zone_info['guide']} (Touch sensor now)"
+                                )
 
-                        stage += 1
-                        self.set_progress(stage, TOTAL_STAGES, f"Stage {stage}/{TOTAL_STAGES} Passed ✓")
-                        self.append_log(f"✓ Stage {stage}/{TOTAL_STAGES} enrolled (grad={grad:.1f}).")
+                        self.proc.stdout.close()
+                        rc = self.proc.wait()
+                    except Exception as e:
+                        self.append_log(f"⚠️ Stage {current_stage} subprocess error: {e}")
+                    finally:
+                        self.proc = None
+                        release_sensor_lock(lock_fd)
 
-                        if stage < TOTAL_STAGES:
-                            self.set_banner("banner-lift", f"LIFT FINGER (Stage {stage}/{TOTAL_STAGES} Passed)", "Lift your finger completely off the pad...")
-                            time.sleep(1.2)
+                    if not self.busy:
+                        self.append_log("🛑 Enrollment stopped by user.")
+                        break
+
+                    captured_file = stage_tmp if (os.path.exists(stage_tmp) and os.path.getsize(stage_tmp) > 1000) else None
+
+                    if captured_file:
+                        raw = cv2.imread(captured_file, cv2.IMREAD_GRAYSCALE)
+                        if raw is not None:
+                            usable, contrast, grad = self.dense_matcher.get_quality(raw)
+                            try:
+                                self.load_preview_image(captured_file)
+                            except Exception:
+                                pass
+
+                            if not usable:
+                                self.append_log(
+                                    f"⚠️ Stage {current_stage} low quality (contrast={contrast:.1f}, grad={grad:.1f}). Lift finger and retry."
+                                )
+                                self.set_banner(
+                                    "banner-error",
+                                    f"RETRY STAGE {current_stage}/{TOTAL_STAGES} — LIFT FINGER NOW",
+                                    "Weak scan. Lift finger completely off sensor for 1.8s baseline reset..."
+                                )
+                                time.sleep(1.8)
+                                continue
+
+                            dest_file = os.path.join(persistent_dir, f"stage_{current_stage:02d}.pgm")
+                            if os.path.abspath(captured_file) != os.path.abspath(dest_file):
+                                shutil.copyfile(captured_file, dest_file)
+                            try:
+                                shutil.copyfile(captured_file, PREVIEW_TMP_PATH)
+                            except Exception:
+                                pass
+
+                            user = os.environ.get("USER", "shohag-rana")
+                            for sys_target in (user, "root"):
+                                try:
+                                    sys_tmpl = f"/var/lib/goodix-gm168/templates/{sys_target}/{finger}/stage_{current_stage:02d}.pgm"
+                                    os.makedirs(os.path.dirname(sys_tmpl), exist_ok=True)
+                                    if os.path.abspath(captured_file) != os.path.abspath(sys_tmpl):
+                                        shutil.copyfile(captured_file, sys_tmpl)
+                                except Exception:
+                                    pass
+
+                            stage += 1
+                            self.set_progress(stage, TOTAL_STAGES, f"Stage {stage}/{TOTAL_STAGES} Passed ✓")
+                            self.append_log(
+                                f"✓ Stage {stage:02d}/{TOTAL_STAGES} enrolled (contrast={contrast:.1f}, grad={grad:.1f})."
+                            )
+
+                            if stage < TOTAL_STAGES and self.busy:
+                                self.set_banner(
+                                    "banner-lift",
+                                    f"✋ LIFT FINGER OFF SENSOR (Stage {stage}/{TOTAL_STAGES} Passed ✓)",
+                                    "Keep finger lifted for 1.8s so USB & FDT baseline can recalibrate..."
+                                )
+                                time.sleep(1.8)
+                        else:
+                            self.append_log(f"⚠️ Stage {current_stage}: Could not decode PGM frame. Lift finger and retry...")
+                            self.set_banner(
+                                "banner-error",
+                                "Frame Decode Error — Lift Finger",
+                                "Lift finger off sensor for 1.8s before next attempt..."
+                            )
+                            time.sleep(1.8)
                     else:
-                        self.append_log("⚠️ Could not decode frame. Retrying...")
-                        time.sleep(1.2)
-                else:
-                    self.append_log(f"⏱️ Stage {current_stage} timed out. Lift and touch again...")
-                    self.set_banner("banner-waiting", "No Touch Registered", "Touch firmly when ready.")
-                    time.sleep(1.2)
+                        self.append_log(
+                            f"⏱️ Stage {current_stage} capture incomplete (rc={rc}). Lift finger completely and retry..."
+                        )
+                        self.set_banner(
+                            "banner-waiting",
+                            f"Stage {current_stage}/{TOTAL_STAGES}: Lift Finger to Recalibrate",
+                            "Keep finger OFF sensor for 1.8s so FDT baseline resets cleanly..."
+                        )
+                        time.sleep(1.8)
 
-            self.set_progress(TOTAL_STAGES, TOTAL_STAGES, "Enrolled 16/16 ✓")
-            self.set_banner("banner-success", "🎉 Enrollment Complete!", f"16 stages enrolled for '{finger}'. DRFM biometric gallery ready.")
-            self.append_log(f"🎉 Successfully enrolled all 16 stages for '{finger}'!")
-            self.set_busy(False)
-            self.refresh_status()
+                if stage >= TOTAL_STAGES and self.busy:
+                    self.set_progress(TOTAL_STAGES, TOTAL_STAGES, "Enrolled 16/16 ✓")
+                    self.set_banner(
+                        "banner-success",
+                        "🎉 Enrollment Complete!",
+                        f"All 16 stages enrolled for '{finger}'. DRFM biometric gallery ready."
+                    )
+                    self.append_log(f"🎉 Successfully enrolled all 16 stages for '{finger}'!")
+            except Exception as e:
+                self.append_log(f"❌ Enrollment exception: {e}")
+                self.set_banner("banner-error", "Enrollment Error", str(e))
+            finally:
+                self.proc = None
+                self.suppress_preview_poll = False
+                self.set_busy(False)
+                self.refresh_status()
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def on_match_dense(self, _btn):
+        if self.busy:
+            return
         finger = self.finger_combo.get_active_id() or "right-index-finger"
         template_dir = os.path.join(TEMPLATES_BASE_DIR, finger)
         templates = sorted(glob.glob(os.path.join(template_dir, "*.pgm")))
@@ -921,57 +1110,106 @@ class ModernBiometricApp(Gtk.Application):
         self.set_banner("banner-ready", "DRFM Verify: Touch Sensor (360°)", "Acquiring live probe frame...")
 
         def _worker():
-            env = os.environ.copy()
-            env.update({
-                "GOODIX_GM168_DIR": find_psk_dir(),
-                "LD_LIBRARY_PATH": find_lib_dir(),
-                "GM168_DUMP_FRAMES": "1",
-                "GM168_DUMP_DIR": "/tmp"
-            })
-            exe = find_capture_bin()
-            probe_path = "/tmp/dense_probe.pgm"
-            if os.path.exists(probe_path):
-                os.remove(probe_path)
-
-            self.proc = subprocess.Popen(["timeout", "15s", exe, probe_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            self.proc.wait()
-
-            if not os.path.exists(probe_path):
-                self.set_banner("banner-idle", "Timed Out", "No finger contact detected.")
+            ensure_fprintd_stopped()
+            lock_fd = acquire_sensor_lock()
+            if not lock_fd:
+                self.append_log("⚠️ Sensor busy: another biometric worker holds the hardware lock.")
+                self.set_banner("banner-error", "Sensor Busy", "Another auth process is running.")
                 self.set_busy(False)
                 return
 
-            probe_img = cv2.imread(probe_path, cv2.IMREAD_GRAYSCALE)
-            is_usable, contrast, grad = self.dense_matcher.get_quality(probe_img)
-            self.append_log(f"Probe Quality: usable={is_usable}, std={contrast:.1f}, grad_var={grad:.1f}")
+            try:
+                psk_dir = find_psk_dir()
+                ld_dir = find_lib_dir()
+                ld_paths = [p for p in [ld_dir, "/usr/local/lib/goodix-gm168"] if os.path.isdir(p)]
+                env = os.environ.copy()
+                env.update({
+                    "GOODIX_GM168_DIR": psk_dir,
+                    "LD_LIBRARY_PATH": ":".join(ld_paths),
+                    "GM168_DUMP_FRAMES": "0"
+                })
+                exe = find_capture_bin()
+                probe_path = "/tmp/dense_probe.pgm"
+                if os.path.exists(probe_path):
+                    try:
+                        os.remove(probe_path)
+                    except OSError:
+                        pass
 
-            matched, max_inl, rot, vis, qp, gt, stage, hits, best_path = self.dense_matcher.match_gallery(probe_img, templates)
+                self.proc = subprocess.Popen(
+                    ["timeout", "15s", exe, probe_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env
+                )
+                for line in iter(self.proc.stdout.readline, ""):
+                    line_str = line.strip()
+                    if line_str:
+                        self.append_log(f"[VERIFY] {line_str}")
+                        if "Touch Detected" in line_str or "touch detected" in line_str.lower():
+                            self.set_banner("banner-scanning", "TOUCH DETECTED", "Matching against 16-stage gallery...")
+                self.proc.stdout.close()
+                self.proc.wait()
 
-            if vis is not None:
-                self.display_numpy_image(vis)
+                if not os.path.exists(probe_path) or os.path.getsize(probe_path) <= 1000:
+                    self.set_banner("banner-idle", "Timed Out", "No finger contact detected.")
+                    return
 
-            thresh = self.dense_matcher.min_inliers
-            GLib.idle_add(lambda: self.metric_kps_lbl.set_text(f"Telemetry: Score {qp}/100 • NCC {gt}% (Hits: {hits})") or False)
-            GLib.idle_add(lambda: self.metric_inliers_lbl.set_text(f"Inliers: {max_inl}/{thresh} (Stage {stage})") or False)
-            GLib.idle_add(lambda: self.metric_rot_lbl.set_text(f"Rotation Delta: {rot:+.1f}°") or False)
+                probe_img = cv2.imread(probe_path, cv2.IMREAD_GRAYSCALE)
+                is_usable, contrast, grad = self.dense_matcher.get_quality(probe_img)
+                self.append_log(f"Probe Quality: usable={is_usable}, std={contrast:.1f}, grad_var={grad:.1f}")
 
-            if matched:
-                study_applied = self.dense_matcher.adaptive_study(probe_img, best_path, max_inl)
-                study_str = f" [gx_templateStudy: Updated Stage {stage}]" if study_applied else ""
-                self.append_log(f"✅ DRFM MATCH SUCCESS: Score={qp}/100, Inliers={max_inl} >= {thresh}, Stage={stage}, Hits={hits}, Rot={rot:+.1f}°{study_str}")
-                self.set_banner("banner-success", f"🔓 ACCESS GRANTED: Score {qp}/100", f"Verified on Stage {stage} ({max_inl} Inliers, {hits} Hits).{study_str}")
-                self.set_progress(1, 1, f"VERIFIED ✓ (Score {qp}/100)")
-            else:
-                self.append_log(f"❌ DRFM REJECT: Score={qp}/100, Inliers={max_inl}/{thresh}, Hits={hits} (Stage {stage}).")
-                self.set_banner("banner-error", f"❌ ACCESS DENIED: Score {qp}/100", f"Impostor rejected (Inliers: {max_inl}/{thresh}, Hits: {hits}).")
-                self.set_progress(0, 1, f"ACCESS DENIED ✗ (Score {qp}/100)")
+                matched, max_inl, rot, vis, qp, gt, stage, hits, best_path = self.dense_matcher.match_gallery(
+                    probe_img, templates
+                )
+                self.append_log(f"Backend match result: {matched} (Score: {qp}, Inliers: {max_inl})")
 
-            self.set_busy(False)
+                if vis is not None:
+                    self.display_numpy_image(vis)
+
+                thresh = self.dense_matcher.min_inliers
+                GLib.idle_add(lambda: self.metric_kps_lbl.set_text(f"Telemetry: Score {qp}/100 • NCC {gt}% (Hits: {hits})") or False)
+                GLib.idle_add(lambda: self.metric_inliers_lbl.set_text(f"Inliers: {max_inl}/{thresh} (Stage {stage})") or False)
+                GLib.idle_add(lambda: self.metric_rot_lbl.set_text(f"Rotation Delta: {rot:+.1f}°") or False)
+
+                if matched:
+                    study_applied = self.dense_matcher.adaptive_study(probe_img, best_path, max_inl)
+                    study_str = f" [gx_templateStudy: Updated Stage {stage}]" if study_applied else ""
+                    self.append_log(
+                        f"✅ DRFM MATCH SUCCESS: Score={qp}/100, Inliers={max_inl} >= {thresh}, Stage={stage}, Hits={hits}, Rot={rot:+.1f}°{study_str}"
+                    )
+                    self.set_banner(
+                        "banner-success",
+                        f"🔓 ACCESS GRANTED: Score {qp}/100",
+                        f"Verified on Stage {stage} ({max_inl} Inliers, {hits} Hits).{study_str}"
+                    )
+                    self.set_progress(1, 1, f"VERIFIED ✓ (Score {qp}/100)")
+                else:
+                    self.append_log(
+                        f"❌ DRFM REJECT: Score={qp}/100, Inliers={max_inl}/{thresh}, Hits={hits} (Stage {stage})."
+                    )
+                    self.set_banner(
+                        "banner-error",
+                        f"❌ ACCESS DENIED: Score {qp}/100",
+                        f"Impostor rejected (Inliers: {max_inl}/{thresh}, Hits: {hits})."
+                    )
+                    self.set_progress(0, 1, f"ACCESS DENIED ✗ (Score {qp}/100)")
+            except Exception as e:
+                self.append_log(f"Verify error: {e}")
+                self.set_banner("banner-error", "Verify Error", str(e))
+            finally:
+                self.proc = None
+                release_sensor_lock(lock_fd)
+                self.set_busy(False)
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def on_verify_fprintd(self, _btn):
         """Tests system PAM authentication using the DRFM PAM verification helper."""
+        if self.busy:
+            return
         self.set_busy(True)
         self.set_progress(0, 1, "Arming sensor...")
         self.set_banner(
@@ -983,52 +1221,71 @@ class ModernBiometricApp(Gtk.Application):
 
         def _worker():
             user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
-            helper = "/usr/local/bin/pam_goodix_verify.py" if os.path.exists("/usr/local/bin/pam_goodix_verify.py") else os.path.join(CURRENT_DIR, "pam_goodix_verify.py")
-
-            self.proc = subprocess.Popen(
-                [sys.executable, helper, user],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
+            local_helper = os.path.join(CURRENT_DIR, "pam_goodix_verify.py")
+            helper = (
+                local_helper
+                if os.path.exists(local_helper)
+                else "/usr/local/bin/pam_goodix_verify.py"
             )
-            for line in self.proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                self.append_log(line)
-                if "Place finger" in line or "ready" in line.lower():
-                    self.set_banner("banner-ready", "SENSOR READY: Touch Finger Now", "Place enrolled finger firmly on the sensor.")
-                elif "Verifying" in line or "Touch detected" in line:
-                    self.set_banner("banner-scanning", "TOUCH DETECTED: Analyzing DRFM...", "Matching against enrolled gallery...")
-                elif "recognized" in line or "Authenticated" in line or "SUCCESS" in line:
-                    self.set_banner(
-                        "banner-success",
-                        "🔓 SYSTEM UNLOCKED!",
-                        "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
-                    )
-                    self.set_progress(1, 1, "PAM VERIFIED ✓")
-                elif "timed out" in line:
-                    self.set_banner(
-                        "banner-idle",
-                        "Sensor Timed Out",
-                        "No finger touch registered within acquisition window."
-                    )
-                elif "not recognized" in line or "REJECTED" in line or "unclear" in line:
-                    self.set_banner(
-                        "banner-error",
-                        "❌ AUTHENTICATION FAILED",
-                        "Finger rejected or not recognized. Check finger placement."
-                    )
-                    self.set_progress(0, 1, "ACCESS DENIED ✗")
-            self.proc.wait()
 
-            if self.proc.returncode == 0:
-                self.append_log("✅ DRFM SYSTEM AUTH SUCCESS: Access GRANTED (Exit 0).")
-            else:
-                self.append_log(f"❌ DRFM SYSTEM AUTH DENIED (Exit {self.proc.returncode}).")
+            try:
+                self.proc = subprocess.Popen(
+                    [sys.executable, helper, user],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                for line in iter(self.proc.stdout.readline, ""):
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    self.append_log(line_str)
+                    if "Place finger" in line_str or "ready" in line_str.lower():
+                        self.set_banner(
+                            "banner-ready",
+                            "SENSOR READY: Touch Finger Now",
+                            "Place enrolled finger firmly on the sensor."
+                        )
+                    elif "Verifying" in line_str or "Touch detected" in line_str:
+                        self.set_banner(
+                            "banner-scanning",
+                            "TOUCH DETECTED: Analyzing DRFM...",
+                            "Matching against enrolled gallery..."
+                        )
+                    elif "recognized" in line_str or "Authenticated" in line_str or "SUCCESS" in line_str:
+                        self.set_banner(
+                            "banner-success",
+                            "🔓 SYSTEM UNLOCKED!",
+                            "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
+                        )
+                        self.set_progress(1, 1, "PAM VERIFIED ✓")
+                    elif "timed out" in line_str:
+                        self.set_banner(
+                            "banner-idle",
+                            "Sensor Timed Out",
+                            "No finger touch registered within acquisition window."
+                        )
+                    elif "not recognized" in line_str or "REJECTED" in line_str or "unclear" in line_str:
+                        self.set_banner(
+                            "banner-error",
+                            "❌ AUTHENTICATION FAILED",
+                            "Finger rejected or not recognized. Check finger placement."
+                        )
+                        self.set_progress(0, 1, "ACCESS DENIED ✗")
 
-            self.set_busy(False)
+                self.proc.stdout.close()
+                self.proc.wait()
+
+                if self.proc.returncode == 0:
+                    self.append_log("✅ DRFM SYSTEM AUTH SUCCESS: Access GRANTED (Exit 0).")
+                else:
+                    self.append_log(f"❌ DRFM SYSTEM AUTH DENIED (Exit {self.proc.returncode}).")
+            except Exception as e:
+                self.append_log(f"PAM test error: {e}")
+            finally:
+                self.proc = None
+                self.set_busy(False)
 
         threading.Thread(target=_worker, daemon=True).start()
 

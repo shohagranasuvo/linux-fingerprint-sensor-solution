@@ -4,8 +4,8 @@ Goodix GM168 Dense Ridge-Flow Matcher (DRFM) - Windows Hello Enclave Parity Edit
 Implements REA techniques reverse-engineered from GoodixEngineAdapter.dll & AdapterEnclave.signed.dll:
   - FpRecogPreProc: CLAHE + high-pass ridge enhancement + 10px sensor bezel masking
   - fingerFeatureRecognition: Multi-octave ORB + 6px physical spatial deduplication
-  - identifyImage: 2D Rigid-Affine RANSAC + Scale Gate + valid_area + Patch NCC + Composite match_score
-  - Zero-FAR Dual-Path Gate: High-confidence single template OR multi-stage gallery consensus
+  - identifyImage: 2D Rigid-Affine RANSAC + Scale Gate + valid_area + Ridge-Masked NCC + Composite match_score
+  - Zero-FAR Dual-Path Gate: High-confidence single template OR strict multi-stage gallery consensus
   - gx_templateStudy: Guarded high-confidence adaptive gallery template enrichment
 """
 
@@ -19,13 +19,13 @@ class DenseRidgeMatcher:
     def __init__(
         self,
         min_inliers: int = 10,
-        lowe_ratio: float = 0.72,
-        max_hamming: int = 56,
-        min_valid_area_ratio: float = 0.12,
-        min_ncc: float = 0.28,
-        match_score_threshold: int = 65,
+        lowe_ratio: float = 0.70,
+        max_hamming: int = 50,
+        min_valid_area_ratio: float = 0.16,
+        min_ncc: float = 0.36,
+        match_score_threshold: int = 70,
     ):
-        self.min_inliers = max(8, min_inliers)
+        self._min_inliers = max(10, int(min_inliers))
         self.lowe_ratio = lowe_ratio
         self.max_hamming = max_hamming
         self.min_valid_area_ratio = min_valid_area_ratio
@@ -46,6 +46,14 @@ class DenseRidgeMatcher:
         )
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
+    @property
+    def min_inliers(self) -> int:
+        return self._min_inliers
+
+    @min_inliers.setter
+    def min_inliers(self, value: int):
+        self._min_inliers = max(10, int(value))
+
     def get_quality(self, img: np.ndarray):
         """Evaluates sensor frame quality (image_quality metric)."""
         if img is None or img.size == 0:
@@ -62,7 +70,6 @@ class DenseRidgeMatcher:
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Standardize to 4x upscaled resolution (320x256 for 80x64 GM168 sensor)
         if img.shape[1] < 160 or img.shape[0] < 128:
             img = cv2.resize(img, (320, 256), interpolation=cv2.INTER_CUBIC)
 
@@ -71,7 +78,6 @@ class DenseRidgeMatcher:
         blur = cv2.GaussianBlur(eq, (3, 3), 0.8)
         sharp = cv2.addWeighted(eq, 1.45, blur, -0.45, 0)
 
-        # Build foreground ridge mask and exclude 10px sensor bezel artifacts
         gx = cv2.Sobel(sharp, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(sharp, cv2.CV_32F, 0, 1, ksize=3)
         energy = cv2.GaussianBlur(np.hypot(gx, gy), (15, 15), 0)
@@ -89,14 +95,10 @@ class DenseRidgeMatcher:
         """fingerFeatureRecognition: extracts ORB features over valid ridge mask."""
         proc, mask = self.preprocess(img)
         kps, des = self.orb.detectAndCompute(proc, mask)
-        return proc, kps, des
+        return proc, mask, kps, des
 
     @staticmethod
     def _deduplicate_physical_inliers(pts_src: np.ndarray, pts_dst: np.ndarray, dists: np.ndarray, cell_px: float = 6.0):
-        """
-        Eliminates multi-octave duplicate keypoints occupying the same physical ridge coordinate.
-        Retains only the lowest Hamming distance match per 6x6 px physical cell.
-        """
         best_by_src = {}
         for i in range(len(pts_src)):
             cell = (int(round(pts_src[i, 0] / cell_px)), int(round(pts_src[i, 1] / cell_px)))
@@ -121,7 +123,6 @@ class DenseRidgeMatcher:
 
     @staticmethod
     def _compute_valid_area_ratio(pts: np.ndarray, shape: tuple):
-        """Computes valid_area spread (bounding box + convex hull) as fraction of active sensor area."""
         if len(pts) < 4:
             return 0.0, 0.0, 0.0
         h, w = shape[:2]
@@ -138,14 +139,23 @@ class DenseRidgeMatcher:
         return min(1.0, effective_area / active_area), span_x, span_y
 
     @staticmethod
-    def _compute_overlap_ncc(probe_proc: np.ndarray, tmpl_proc: np.ndarray, M: np.ndarray):
-        """Computes ridge-flow Normalized Cross-Correlation and overlap_rate_between_last_template."""
+    def _compute_overlap_ncc(
+        probe_proc: np.ndarray,
+        probe_mask: np.ndarray,
+        tmpl_proc: np.ndarray,
+        tmpl_mask: np.ndarray,
+        M: np.ndarray,
+    ):
+        """Computes ridge-flow Normalized Cross-Correlation strictly over overlapping active ridge masks."""
         h, w = tmpl_proc.shape[:2]
-        warped_probe = cv2.warpAffine(probe_proc, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        ones = np.ones((h, w), dtype=np.uint8) * 255
-        overlap_mask = cv2.warpAffine(ones, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        warped_probe = cv2.warpAffine(
+            probe_proc, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        warped_p_mask = cv2.warpAffine(
+            probe_mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
 
-        # Exclude sensor borders
+        overlap_mask = cv2.bitwise_and(warped_p_mask, tmpl_mask)
         overlap_mask[:10, :] = 0
         overlap_mask[-10:, :] = 0
         overlap_mask[:, :10] = 0
@@ -153,7 +163,7 @@ class DenseRidgeMatcher:
 
         valid_px = overlap_mask > 0
         overlap_rate = float(np.count_nonzero(valid_px)) / float(max(1, (w - 20) * (h - 20)))
-        if overlap_rate < 0.15:
+        if overlap_rate < 0.22:
             return 0.0, overlap_rate
 
         p_vals = warped_probe[valid_px].astype(np.float32)
@@ -172,17 +182,16 @@ class DenseRidgeMatcher:
         Matches probe against a single gallery template using Windows Hello Goodix verification gates.
         Returns: (is_valid_hit, unique_inliers, rotation_deg, valid_area_pct, match_score, ncc, vis_canvas)
         """
-        p_proc, kp1, des1 = self.extract_features(probe_img)
-        t_proc, kp2, des2 = self.extract_features(tmpl_img)
+        p_proc, p_mask, kp1, des1 = self.extract_features(probe_img)
+        t_proc, t_mask, kp2, des2 = self.extract_features(tmpl_img)
 
-        # Prepare side-by-side visualization canvas
         hp, wp = p_proc.shape
         ht, wt = t_proc.shape
         canvas = np.zeros((max(hp, ht), wp + wt, 3), dtype=np.uint8)
         canvas[:hp, :wp] = cv2.cvtColor(p_proc, cv2.COLOR_GRAY2BGR)
         canvas[:ht, wp:] = cv2.cvtColor(t_proc, cv2.COLOR_GRAY2BGR)
 
-        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
+        if des1 is None or des2 is None or len(kp1) < 12 or len(kp2) < 12:
             return False, 0, 0.0, 0.0, 0, 0.0, canvas
 
         raw_matches = self.bf.knnMatch(des1, des2, k=2)
@@ -193,7 +202,7 @@ class DenseRidgeMatcher:
                 if m.distance <= self.max_hamming and m.distance < self.lowe_ratio * n.distance:
                     good.append(m)
 
-        if len(good) < 5:
+        if len(good) < 6:
             return False, 0, 0.0, 0.0, 0, 0.0, canvas
 
         pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
@@ -204,7 +213,7 @@ class DenseRidgeMatcher:
             pts1,
             pts2,
             method=cv2.RANSAC,
-            ransacReprojThreshold=3.8,
+            ransacReprojThreshold=2.8,
             maxIters=3000,
             confidence=0.995,
         )
@@ -212,12 +221,12 @@ class DenseRidgeMatcher:
             return False, 0, 0.0, 0.0, 0, 0.0, canvas
 
         mask_bool = inlier_mask.ravel() == 1
-        if np.count_nonzero(mask_bool) < 5:
+        if np.count_nonzero(mask_bool) < 6:
             return False, 0, 0.0, 0.0, 0, 0.0, canvas
 
-        # 1. Rigid Scale Gate: human skin cannot scale > ±8%
+        # 1. Rigid Scale Gate: human skin cannot scale > ±6%
         scale = float(np.hypot(M[0, 0], M[1, 0]))
-        if not (0.92 <= scale <= 1.08):
+        if not (0.94 <= scale <= 1.06):
             return False, 0, 0.0, 0.0, 0, 0.0, canvas
 
         rot_deg = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
@@ -227,17 +236,17 @@ class DenseRidgeMatcher:
             pts1[mask_bool], pts2[mask_bool], dists[mask_bool], cell_px=6.0
         )
         unique_inliers = len(u_pts1)
-        if unique_inliers < 5:
+        if unique_inliers < 6:
             return False, unique_inliers, rot_deg, 0.0, 0, 0.0, canvas
 
         # 3. Valid Area Coverage Gate (valid_area)
         area_ratio, span_x, span_y = self._compute_valid_area_ratio(u_pts1, p_proc.shape)
-        if span_x < 42.0 or span_y < 34.0 or area_ratio < self.min_valid_area_ratio:
+        if span_x < 48.0 or span_y < 38.0 or area_ratio < self.min_valid_area_ratio:
             return False, unique_inliers, rot_deg, area_ratio * 100.0, 0, 0.0, canvas
 
-        # 4. Dense Ridge-Flow Alignment NCC & Overlap Rate
-        ncc, overlap_rate = self._compute_overlap_ncc(p_proc, t_proc, M)
-        if ncc < self.min_ncc or overlap_rate < 0.20:
+        # 4. Dense Ridge-Flow Alignment NCC & Overlap Rate over active ridges
+        ncc, overlap_rate = self._compute_overlap_ncc(p_proc, p_mask, t_proc, t_mask, M)
+        if ncc < self.min_ncc or overlap_rate < 0.25:
             return False, unique_inliers, rot_deg, area_ratio * 100.0, 0, ncc, canvas
 
         # 5. Composite Windows Hello match_score (0 - 100)
@@ -248,21 +257,22 @@ class DenseRidgeMatcher:
         desc_term = max(0.0, (1.0 - (mean_dist / 64.0)) * 10.0)
         match_score = int(round(min(100.0, inlier_term + area_term + ncc_term + desc_term)))
 
+        stage_inlier_floor = max(9, self.min_inliers - 1)
         is_stage_hit = (
-            unique_inliers >= 7
+            unique_inliers >= stage_inlier_floor
             and area_ratio >= self.min_valid_area_ratio
             and ncc >= self.min_ncc
-            and match_score >= 52
+            and match_score >= (self.match_score_threshold - 5)
         )
 
-        # Draw green inlier lines for visualization
-        line_color = (0, 255, 64) if is_stage_hit else (0, 140, 255)
+        line_color = (0, 255, 64) if is_stage_hit else (0, 0, 220)
+        pt_color = (0, 255, 64) if is_stage_hit else (0, 64, 255)
         for s_pt, t_pt in zip(u_pts1, u_pts2):
             p1 = (int(round(s_pt[0])), int(round(s_pt[1])))
             p2 = (int(round(t_pt[0] + wp)), int(round(t_pt[1])))
             cv2.line(canvas, p1, p2, line_color, 1, cv2.LINE_AA)
-            cv2.circle(canvas, p1, 3, (0, 255, 64), -1)
-            cv2.circle(canvas, p2, 3, (0, 255, 64), -1)
+            cv2.circle(canvas, p1, 3, pt_color, -1)
+            cv2.circle(canvas, p2, 3, pt_color, -1)
 
         return is_stage_hit, unique_inliers, rot_deg, area_ratio * 100.0, match_score, ncc, canvas
 
@@ -274,10 +284,8 @@ class DenseRidgeMatcher:
 
     def match_gallery(self, probe_img: np.ndarray, candidate_paths: list):
         """
-        identifyImage: Evaluates probe against all enrolled gallery templates.
+        identifyImage: Evaluates probe against all enrolled gallery templates of a single finger.
         Enforces strict single-template certainty OR multi-stage consensus to guarantee Zero-FAR.
-        Returns 9-tuple compatible with PAM and GUI callers:
-          (matched, best_inliers, best_rot, best_vis, best_score, ncc, best_stage, stage_hits, best_path)
         """
         usable, contrast, grad = self.get_quality(probe_img)
         if not usable:
@@ -304,7 +312,7 @@ class DenseRidgeMatcher:
             if is_hit:
                 stage_hits += 1
 
-            if (score > best_score) or (score == best_score and inliers > best_inliers):
+            if (inliers > best_inliers) or (inliers == best_inliers and score > best_score):
                 best_score = score
                 best_inliers = inliers
                 best_rot = rot
@@ -315,19 +323,20 @@ class DenseRidgeMatcher:
                 best_stage = self._parse_stage_id(path, idx)
 
         # Zero-FAR Verification Gate:
-        # Path A: High-confidence single stage match (inliers >= min_inliers [10], score >= 65, ncc >= 0.32)
-        # Path B: Multi-stage gallery consensus (stage_hits >= 2, best_inliers >= 8, score >= 60, ncc >= 0.30)
+        # Path A: Strong single-stage match (inliers >= min_inliers+1 [11] OR inliers >= min_inliers [10] with hits >= 2)
         high_single = (
-            best_inliers >= self.min_inliers
+            best_inliers >= (self.min_inliers + 1)
             and best_score >= self.match_score_threshold
-            and best_ncc >= 0.32
+            and best_ncc >= 0.38
             and best_area >= (self.min_valid_area_ratio * 100.0)
         )
+        # Path B: Multi-stage consensus within the SAME finger gallery
         multi_consensus = (
             stage_hits >= 2
-            and best_inliers >= max(8, self.min_inliers - 2)
-            and best_score >= (self.match_score_threshold - 5)
-            and best_ncc >= 0.30
+            and best_inliers >= self.min_inliers
+            and best_score >= (self.match_score_threshold - 2)
+            and best_ncc >= self.min_ncc
+            and best_area >= (self.min_valid_area_ratio * 100.0)
         )
         matched = bool(high_single or multi_consensus)
 
@@ -344,10 +353,6 @@ class DenseRidgeMatcher:
         )
 
     def adaptive_study(self, probe_img: np.ndarray, best_path: str, inliers: int) -> bool:
-        """
-        gx_templateStudy: Blends high-clarity verified probe into matched gallery template
-        only when study_flag criteria (inliers >= 16, usable quality) are strictly met.
-        """
         if not best_path or not os.path.exists(best_path) or inliers < 16:
             return False
 

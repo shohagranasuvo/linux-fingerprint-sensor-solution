@@ -17,33 +17,37 @@ import sys
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_SRC_DIR = "/home/shohag-rana/goodix-gm168-linux-driver/src"
 
-# Universal Python environment bootstrap for root/sudo PAM context
+# Prioritize local source directory over stale /usr/local/lib/goodix-gm168 copies
 SEARCH_PATHS = [
-    "/usr/local/lib/goodix-gm168",
+    REPO_SRC_DIR,
     SCRIPT_DIR,
+    "/usr/local/lib/goodix-gm168",
     "/usr/lib/python3/dist-packages",
     "/usr/local/lib/python3/dist-packages",
 ]
 for pattern in (
+    "/home/*/.local/lib/python3*/site-packages",
+    "/home/*/.local/lib/python3*/dist-packages",
     "/usr/local/lib/python3*/dist-packages",
     "/usr/local/lib/python3*/site-packages",
     "/usr/lib/python3*/dist-packages",
-    "/home/*/.local/lib/python3*/site-packages",
 ):
     for pkg_dir in sorted(glob.glob(pattern), reverse=True):
         if os.path.isdir(pkg_dir) and pkg_dir not in SEARCH_PATHS:
             SEARCH_PATHS.append(pkg_dir)
 
 for p in reversed(SEARCH_PATHS):
-    if p not in sys.path:
+    if os.path.isdir(p):
+        while p in sys.path:
+            sys.path.remove(p)
         sys.path.insert(0, p)
 
 try:
     import cv2
     import numpy as np
 except ImportError as exc:
-    # Fallback: re-exec with system /usr/bin/python3 if a custom binary without cv2 was invoked
     if sys.executable != "/usr/bin/python3" and os.path.exists("/usr/bin/python3"):
         os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
     sys.stderr.write(f"PAM Goodix: OpenCV import failed ({exc})\n")
@@ -61,6 +65,19 @@ OUT_FRAME = "/tmp/pam_probe.pgm"
 MIN_INLIERS = 10
 LOG_FILE = "/tmp/goodix-pam.log"
 LOCK_FILE = "/run/goodix_sensor.lock"
+
+VALID_FINGERS = (
+    "right-index-finger",
+    "right-middle-finger",
+    "right-ring-finger",
+    "right-thumb",
+    "right-little-finger",
+    "left-index-finger",
+    "left-middle-finger",
+    "left-thumb",
+    "left-ring-finger",
+    "left-little-finger",
+)
 
 
 def user_msg(msg: str):
@@ -87,7 +104,6 @@ def debug_log(msg: str):
 def ensure_fprintd_stopped():
     """Prevents USB device contention with conflicting background fprintd service."""
     try:
-        # If running as root, stop and mask fprintd permanently so D-Bus won't restart it
         subprocess.run(["systemctl", "stop", "fprintd.service"], capture_output=True, timeout=2)
         subprocess.run(["systemctl", "mask", "fprintd.service"], capture_output=True, timeout=2)
     except Exception:
@@ -140,14 +156,11 @@ def _exec_single_capture(env: dict, timeout_sec: int = 15) -> tuple:
 
 def capture_sensor_touch() -> bool:
     """Arms the sensor and captures a live touch frame with hardware mutex and auto-retry."""
-    # Ensure background fprintd cannot contend for USB
     ensure_fprintd_stopped()
 
-    # Hardware concurrency lock: prevent multiple PAM workers (e.g. GDM workers) from colliding on USB
     lock_fd = None
     try:
         lock_fd = open(LOCK_FILE, "w")
-        # Wait up to 2 seconds for any existing capture to release
         start_wait = time.time()
         locked = False
         while time.time() - start_wait < 2.0:
@@ -182,7 +195,6 @@ def capture_sensor_touch() -> bool:
             debug_log(f"Probe frame captured successfully ({os.path.getsize(OUT_FRAME)} bytes).")
             return True
 
-        # If process exited with error (e.g. transient TLS / USB collision from prior wake), retry once
         if retcode == 1:
             debug_log("Capture attempt 1 encountered USB/TLS glitch. Retrying after brief settle...")
             time.sleep(0.2)
@@ -191,12 +203,8 @@ def capture_sensor_touch() -> bool:
                 debug_log(f"Probe frame captured on retry ({os.path.getsize(OUT_FRAME)} bytes).")
                 return True
 
-        if retcode == 124:
-            user_msg("⏱️ Fingerprint sensor timed out.")
-            debug_log("Sensor acquisition timed out.")
-        else:
-            user_msg("⏱️ Fingerprint sensor timed out.")
-            debug_log(f"Sensor acquisition ended without valid frame (exit={retcode}).")
+        user_msg("⏱️ Fingerprint sensor timed out.")
+        debug_log(f"Sensor acquisition ended without valid frame (exit={retcode}).")
         return False
     except Exception as e:
         debug_log(f"Capture error exception: {e}")
@@ -211,36 +219,46 @@ def capture_sensor_touch() -> bool:
                 pass
 
 
-def get_candidate_templates(target_user: str) -> list:
-    """Discovers all enrolled biometric template frames for the target user."""
-    candidates = []
-    search_dirs = [
-        f"/var/lib/goodix-gm168/templates/{target_user}",
-        "/var/lib/goodix-gm168/templates/root",
-        "/var/lib/goodix-gm168/templates",
-    ]
+def get_candidate_templates(target_user: str) -> dict:
+    """
+    Discovers enrolled template frames strictly from the target user's GUI config directory,
+    grouped by finger profile to prevent cross-profile consensus false positives.
+    """
+    profiles = {}
+    base_dir = None
 
-    # Resolve home directory
     try:
         pw = pwd.getpwnam(target_user)
-        search_dirs.append(os.path.join(pw.pw_dir, ".config/goodix-gm168/templates"))
+        candidate_dir = os.path.join(pw.pw_dir, ".config/goodix-gm168/templates")
+        if os.path.isdir(candidate_dir):
+            base_dir = candidate_dir
     except KeyError:
         pass
 
-    for user_home in glob.glob("/home/*"):
-        search_dirs.append(os.path.join(user_home, ".config/goodix-gm168/templates"))
+    if not base_dir:
+        sys_user_dir = f"/var/lib/goodix-gm168/templates/{target_user}"
+        if os.path.isdir(sys_user_dir):
+            base_dir = sys_user_dir
 
-    for d in search_dirs:
-        if os.path.isdir(d):
-            candidates.extend(glob.glob(os.path.join(d, "*.pgm")))
-            candidates.extend(glob.glob(os.path.join(d, "*", "*.pgm")))
+    if not base_dir:
+        return profiles
 
-    return sorted(list(set(candidates)))
+    for finger in VALID_FINGERS:
+        finger_dir = os.path.join(base_dir, finger)
+        if os.path.isdir(finger_dir):
+            frames = sorted(glob.glob(os.path.join(finger_dir, "stage_*.pgm")))
+            if frames:
+                profiles[finger] = frames
+
+    return profiles
 
 
 def verify_in_process(username: str, img_path: str) -> int:
-    """Executes direct in-process DRFM verification against enrolled templates."""
+    """Executes direct in-process DRFM verification per finger profile (matching GUI behavior)."""
+    import dense_matcher
     from dense_matcher import DenseRidgeMatcher
+
+    debug_log(f"Using dense_matcher module from: {getattr(dense_matcher, '__file__', 'unknown')}")
 
     probe_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if probe_img is None:
@@ -256,26 +274,35 @@ def verify_in_process(username: str, img_path: str) -> int:
         user_msg("❌ Fingerprint unclear. Place finger flat.")
         return 1
 
-    candidates = get_candidate_templates(username)
-    if not candidates:
+    profiles = get_candidate_templates(username)
+    if not profiles:
         debug_log(f"Error: No enrolled templates found for target user '{username}'.")
         user_msg("⚠️ No enrolled fingerprint profiles found.")
         return 1
 
-    matched, inliers, rot, _, score, ncc, stage, hits, best_path = matcher.match_gallery(probe_img, candidates)
-    debug_log(
-        f"Telemetry: match_score={score}, inliers={inliers}/{matcher.min_inliers}, "
-        f"ncc={ncc}%, stage_hits={hits}, best_stage={stage}, rotation={rot:+.1f}°"
-    )
-
-    if matched:
-        if best_path:
-            studied = matcher.adaptive_study(probe_img, best_path, inliers)
-            if studied:
-                debug_log(f"gx_templateStudy: Stage frame '{os.path.basename(best_path)}' refreshed.")
-        debug_log("Authentication SUCCESSFUL.")
-        user_msg("✓ Fingerprint recognized! Authenticated.")
-        return 0
+    for finger, candidates in profiles.items():
+        matched, inliers, rot, _, score, ncc, stage, hits, best_path = matcher.match_gallery(
+            probe_img, candidates
+        )
+        is_verified = bool(
+            matched
+            and inliers >= matcher.min_inliers
+            and score >= 68
+            and ncc >= 36
+            and (inliers >= matcher.min_inliers + 1 or hits >= 2)
+        )
+        debug_log(
+            f"Profile '{finger}': matched={matched}, verified={is_verified}, score={score}, "
+            f"inliers={inliers}/{matcher.min_inliers}, ncc={ncc}%, hits={hits}, stage={stage}, rot={rot:+.1f}°"
+        )
+        if is_verified:
+            if best_path:
+                studied = matcher.adaptive_study(probe_img, best_path, inliers)
+                if studied:
+                    debug_log(f"gx_templateStudy: Stage frame '{os.path.basename(best_path)}' refreshed.")
+            debug_log(f"Authentication SUCCESSFUL on profile '{finger}'.")
+            user_msg("✓ Fingerprint recognized! Authenticated.")
+            return 0
 
     debug_log("Authentication REJECTED (Zero-FAR Enclave Security Gate).")
     user_msg("❌ Fingerprint not recognized.")
@@ -292,13 +319,11 @@ def cleanup():
 
 def main():
     raw_user = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PAM_USER", os.environ.get("USER", ""))
-    # Under sudo, actor might be root while PAM_USER is the real user
     if not raw_user or raw_user == "root":
         sudo_user = os.environ.get("SUDO_USER")
         if sudo_user:
             username = sudo_user
         else:
-            # fallback to primary active interactive user
             users = [u for u in glob.glob("/home/*") if os.path.isdir(u)]
             username = os.path.basename(users[0]) if users else "root"
     else:

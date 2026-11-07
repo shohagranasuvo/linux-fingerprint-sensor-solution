@@ -7,6 +7,9 @@ DRFM + Adaptive Learning (gx_templateStudy) authentication for PAM, sudo, and lo
 
 import glob
 import os
+import pwd
+import socket
+import struct
 import sys
 
 # Bootstrap site-packages
@@ -19,8 +22,6 @@ for user_home in glob.glob("/home/*"):
 if "/usr/local/lib/goodix-gm168" not in sys.path:
     sys.path.insert(0, "/usr/local/lib/goodix-gm168")
 
-import socket
-import struct
 import cv2
 import numpy as np
 
@@ -30,29 +31,51 @@ from dense_matcher import DenseRidgeMatcher
 
 SOCKET_PATH = "/run/goodix_gm168.sock"
 GLOBAL_TEMPLATES_DIR = "/var/lib/goodix-gm168/templates"
-FALLBACK_USER_TEMPLATES = os.path.expanduser("~/.config/goodix-gm168/templates")
-MIN_INLIERS = 4
+MIN_INLIERS = 10
+
+VALID_FINGERS = (
+    "right-index-finger",
+    "right-middle-finger",
+    "right-ring-finger",
+    "right-thumb",
+    "right-little-finger",
+    "left-index-finger",
+    "left-middle-finger",
+    "left-thumb",
+    "left-ring-finger",
+    "left-little-finger",
+)
 
 
-def get_templates_for_user(username: str):
+def get_templates_for_user(username: str) -> dict:
     target = "shohag-rana" if username in ("root", "", None) else username
-    candidates = []
+    profiles = {}
+    base_dir = None
 
-    sys_dir = os.path.join(GLOBAL_TEMPLATES_DIR, target)
-    if os.path.isdir(sys_dir):
-        candidates.extend(glob.glob(os.path.join(sys_dir, "*.pgm")))
-        candidates.extend(glob.glob(os.path.join(sys_dir, "*", "*.pgm")))
-
-    user_home = os.path.expanduser(f"~{target}")
-    if os.path.isdir(user_home):
-        user_conf = os.path.join(user_home, ".config/goodix-gm168/templates")
+    try:
+        pw = pwd.getpwnam(target)
+        user_conf = os.path.join(pw.pw_dir, ".config/goodix-gm168/templates")
         if os.path.isdir(user_conf):
-            candidates.extend(glob.glob(os.path.join(user_conf, "*", "*.pgm")))
+            base_dir = user_conf
+    except KeyError:
+        pass
 
-    if not candidates and os.path.isdir(FALLBACK_USER_TEMPLATES):
-        candidates.extend(glob.glob(os.path.join(FALLBACK_USER_TEMPLATES, "*", "*.pgm")))
+    if not base_dir:
+        sys_dir = os.path.join(GLOBAL_TEMPLATES_DIR, target)
+        if os.path.isdir(sys_dir):
+            base_dir = sys_dir
 
-    return sorted(list(set(candidates)))
+    if not base_dir:
+        return profiles
+
+    for finger in VALID_FINGERS:
+        finger_dir = os.path.join(base_dir, finger)
+        if os.path.isdir(finger_dir):
+            frames = sorted(glob.glob(os.path.join(finger_dir, "stage_*.pgm")))
+            if frames:
+                profiles[finger] = frames
+
+    return profiles
 
 
 def main():
@@ -101,26 +124,45 @@ def main():
                 conn.close()
                 continue
 
-            templates = get_templates_for_user(username)
-            if not templates:
+            profiles = get_templates_for_user(username)
+            if not profiles:
                 print(f"[AUTH] No enrolled templates found for user: {username}")
                 conn.sendall(struct.pack("!III", 0, 0, 0))
                 conn.close()
                 continue
 
-            is_match, inliers, rot, _, _, _, stage, hits, best_path = matcher.match_gallery(probe_img, templates)
+            is_match = False
+            best_inliers = 0
+            best_stage = -1
+            matched_path = None
+            matched_finger = None
+
+            for finger, templates in profiles.items():
+                matched, inliers, _, _, _, _, stage, _, best_path = matcher.match_gallery(
+                    probe_img, templates
+                )
+                if inliers > best_inliers:
+                    best_inliers = inliers
+                    best_stage = stage
+                if matched:
+                    is_match = True
+                    best_inliers = inliers
+                    best_stage = stage
+                    matched_path = best_path
+                    matched_finger = finger
+                    break
 
             studied = 0
-            if is_match and best_path:
-                if matcher.adaptive_study(probe_img, best_path, inliers):
+            if is_match and matched_path:
+                if matcher.adaptive_study(probe_img, matched_path, best_inliers):
                     studied = 1
-                    print(f"[AUTH SUCCESS] User={username}, Inliers={inliers}, Stage={stage} [gx_templateStudy: Enriched ✓]")
+                    print(f"[AUTH SUCCESS] User={username}, Finger={matched_finger}, Inliers={best_inliers}, Stage={best_stage} [gx_templateStudy: Enriched ✓]")
                 else:
-                    print(f"[AUTH SUCCESS] User={username}, Inliers={inliers}, Stage={stage}")
+                    print(f"[AUTH SUCCESS] User={username}, Finger={matched_finger}, Inliers={best_inliers}, Stage={best_stage}")
             else:
-                print(f"[AUTH REJECT] User={username}, Inliers={inliers}")
+                print(f"[AUTH REJECT] User={username}, MaxInliers={best_inliers}")
 
-            conn.sendall(struct.pack("!III", 1 if is_match else 0, inliers, studied))
+            conn.sendall(struct.pack("!III", 1 if is_match else 0, best_inliers, studied))
         except Exception as e:
             print(f"[ERROR] Exception handling request: {e}")
         finally:
