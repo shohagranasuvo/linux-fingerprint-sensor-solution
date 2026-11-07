@@ -1228,6 +1228,7 @@ class ModernBiometricApp(Gtk.Application):
                 else "/usr/local/bin/pam_goodix_verify.py"
             )
 
+            timed_out = False
             try:
                 self.proc = subprocess.Popen(
                     [sys.executable, helper, user],
@@ -1253,36 +1254,60 @@ class ModernBiometricApp(Gtk.Application):
                             "TOUCH DETECTED: Analyzing DRFM...",
                             "Matching against enrolled gallery..."
                         )
-                    elif "recognized" in line_str or "Authenticated" in line_str or "SUCCESS" in line_str:
-                        self.set_banner(
-                            "banner-success",
-                            "🔓 SYSTEM UNLOCKED!",
-                            "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
-                        )
-                        self.set_progress(1, 1, "PAM VERIFIED ✓")
-                    elif "timed out" in line_str:
+                    elif "timed out" in line_str.lower():
+                        timed_out = True
                         self.set_banner(
                             "banner-idle",
                             "Sensor Timed Out",
                             "No finger touch registered within acquisition window."
                         )
-                    elif "not recognized" in line_str or "REJECTED" in line_str or "unclear" in line_str:
+                        self.set_progress(0, 1, "TIMED OUT ⏱️")
+                    elif (
+                        "not recognized" in line_str.lower()
+                        or "rejected" in line_str.lower()
+                        or "denied" in line_str.lower()
+                        or "unclear" in line_str.lower()
+                        or "unreadable" in line_str.lower()
+                        or "no enrolled" in line_str.lower()
+                    ):
                         self.set_banner(
                             "banner-error",
                             "❌ AUTHENTICATION FAILED",
                             "Finger rejected or not recognized. Check finger placement."
                         )
                         self.set_progress(0, 1, "ACCESS DENIED ✗")
+                    elif "Fingerprint recognized" in line_str or "Authenticated" in line_str or "SUCCESSFUL" in line_str:
+                        self.set_banner(
+                            "banner-success",
+                            "🔓 SYSTEM UNLOCKED!",
+                            "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
+                        )
+                        self.set_progress(1, 1, "PAM VERIFIED ✓")
 
                 self.proc.stdout.close()
-                self.proc.wait()
+                rc = self.proc.wait()
 
-                if self.proc.returncode == 0:
+                if rc == 0:
                     self.append_log("✅ DRFM SYSTEM AUTH SUCCESS: Access GRANTED (Exit 0).")
+                    self.set_banner(
+                        "banner-success",
+                        "🔓 SYSTEM UNLOCKED!",
+                        "PAM DRFM verification succeeded! Lockscreen/sudo authorized."
+                    )
+                    self.set_progress(1, 1, "PAM VERIFIED ✓")
                 else:
-                    self.append_log(f"❌ DRFM SYSTEM AUTH DENIED (Exit {self.proc.returncode}).")
+                    self.append_log(f"❌ DRFM SYSTEM AUTH DENIED (Exit {rc}).")
+                    if not timed_out:
+                        self.set_banner(
+                            "banner-error",
+                            "❌ AUTHENTICATION FAILED",
+                            f"PAM DRFM verification denied (Exit {rc})."
+                        )
+                        self.set_progress(0, 1, "ACCESS DENIED ✗")
             except Exception as e:
                 self.append_log(f"PAM test error: {e}")
+                self.set_banner("banner-error", "PAM Auth Error", str(e))
+                self.set_progress(0, 1, "ERROR ✗")
             finally:
                 self.proc = None
                 self.set_busy(False)
