@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PACKAGE_NAME="goodix-gm168-linux-driver"
-VERSION="1.1.0"
+VERSION="1.1.1"
 ARCH="amd64"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/packaging/${PACKAGE_NAME}_${VERSION}_${ARCH}"
@@ -41,6 +41,20 @@ chmod 755 /usr/local/bin/pam_goodix_verify.py
 chmod 755 /usr/local/lib/goodix-gm168/img-capture 2>/dev/null || true
 udevadm control --reload-rules || true
 udevadm trigger || true
+
+# Dynamic sysfs power state initialization for Goodix GM168 sensors
+for dev in /sys/bus/usb/devices/*; do
+    if [ -f "$dev/idVendor" ] && [ "$(cat "$dev/idVendor" 2>/dev/null)" = "27c6" ]; then
+        if [ -f "$dev/idProduct" ]; then
+            prod="$(cat "$dev/idProduct" 2>/dev/null)"
+            if [ "$prod" = "581a" ] || [ "$prod" = "589a" ]; then
+                echo "on" > "$dev/power/control" 2>/dev/null || true
+                echo "-1" > "$dev/power/autosuspend" 2>/dev/null || true
+                echo "1" > "$dev/power/persist" 2>/dev/null || true
+            fi
+        fi
+    fi
+done
 
 systemctl stop fprintd.service 2>/dev/null || true
 systemctl disable fprintd.service 2>/dev/null || true

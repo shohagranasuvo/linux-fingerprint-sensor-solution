@@ -5,7 +5,7 @@
 [![Architecture](https://img.shields.io/badge/Arch-x86__64-blue)]()
 [![Hardware](https://img.shields.io/badge/Goodix-27c6%3A581a%20%7C%2027c6%3A589a-green)]()
 [![Security](https://img.shields.io/badge/Security-Zero--FAR%20Verified-brightgreen)]()
-[![Release](https://img.shields.io/badge/Release-v1.1.0-blue)](https://github.com/shohagranasuvo/linux-fingerprint-sensor-solution/releases)
+[![Release](https://img.shields.io/badge/Release-v1.1.1-blue)](https://github.com/shohagranasuvo/linux-fingerprint-sensor-solution/releases)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
 A complete, production-ready Linux biometric driver, PAM authentication stack, and modern GTK4 management application for **Goodix GM168** capacitive fingerprint sensors.
@@ -63,8 +63,8 @@ The script automatically detects your system ABI, installs dependencies, builds 
 Download and install the Debian package directly from GitHub Releases:
 
 ```bash
-wget https://github.com/shohagranasuvo/linux-fingerprint-sensor-solution/releases/download/v1.1.0/goodix-gm168-linux-driver_1.1.0_amd64.deb
-sudo dpkg -i goodix-gm168-linux-driver_1.1.0_amd64.deb
+wget https://github.com/shohagranasuvo/linux-fingerprint-sensor-solution/releases/download/v1.1.1/goodix-gm168-linux-driver_1.1.1_amd64.deb
+sudo dpkg -i goodix-gm168-linux-driver_1.1.1_amd64.deb
 sudo apt-get install -f
 ```
 

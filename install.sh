@@ -159,12 +159,29 @@ if ! python3 -c "import cv2, numpy" >/dev/null 2>&1; then
 fi
 
 # 4. Install udev access rules
-echo "[4/7] Configuring USB udev access permissions..."
+echo "[4/7] Configuring USB udev access permissions & disabling autosuspend..."
 if [[ -f "${SRC_ROOT}/udev/60-goodix-gm168.rules" ]]; then
     install -m 644 "${SRC_ROOT}/udev/60-goodix-gm168.rules" /etc/udev/rules.d/60-goodix-gm168.rules
-    udevadm control --reload-rules || true
-    udevadm trigger || true
 fi
+
+for pctrl in /sys/bus/usb/devices/*/power/control; do
+    if [[ -f "$pctrl" ]]; then
+        devdir="$(dirname "$(dirname "$pctrl")")"
+        if [[ -f "$devdir/idVendor" && -f "$devdir/idProduct" ]]; then
+            vid="$(cat "$devdir/idVendor" 2>/dev/null || true)"
+            pid="$(cat "$devdir/idProduct" 2>/dev/null || true)"
+            if [[ "$vid" == "27c6" && ("$pid" == "581a" || "$pid" == "589a") ]]; then
+                echo "on" > "$pctrl" 2>/dev/null || true
+                [[ -f "$devdir/power/autosuspend" ]] && echo "-1" > "$devdir/power/autosuspend" 2>/dev/null || true
+                [[ -f "$devdir/power/persist" ]] && echo "1" > "$devdir/power/persist" 2>/dev/null || true
+            fi
+        fi
+    fi
+done
+
+udevadm control --reload-rules || true
+udevadm trigger || true
+
 
 # 5. Migrate templates & cryptographic keys
 echo "[5/7] Synchronizing biometric templates & keys..."

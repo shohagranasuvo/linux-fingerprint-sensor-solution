@@ -47,6 +47,34 @@ VALID_FINGERS = (
 )
 
 
+def heal_usb_power_state():
+    """Ensures USB autosuspend is disabled and power/control is 'on' for Goodix GM168."""
+    try:
+        for pctrl in glob.glob("/sys/bus/usb/devices/*/power/control"):
+            devdir = os.path.dirname(os.path.dirname(pctrl))
+            if os.path.exists(os.path.join(devdir, "idVendor")) and os.path.exists(os.path.join(devdir, "idProduct")):
+                try:
+                    with open(os.path.join(devdir, "idVendor"), "r") as f:
+                        vid = f.read().strip()
+                    with open(os.path.join(devdir, "idProduct"), "r") as f:
+                        pid = f.read().strip()
+                    if vid == "27c6" and pid in ("581a", "589a"):
+                        with open(pctrl, "w") as f:
+                            f.write("on")
+                        autos = os.path.join(devdir, "power/autosuspend")
+                        if os.path.exists(autos):
+                            with open(autos, "w") as f:
+                                f.write("-1")
+                        persist = os.path.join(devdir, "power/persist")
+                        if os.path.exists(persist):
+                            with open(persist, "w") as f:
+                                f.write("1")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def get_templates_for_user(username: str) -> dict:
     target = "shohag-rana" if username in ("root", "", None) else username
     profiles = {}
@@ -79,6 +107,7 @@ def get_templates_for_user(username: str) -> dict:
 
 
 def main():
+    heal_usb_power_state()
     if os.path.exists(SOCKET_PATH):
         try:
             os.unlink(SOCKET_PATH)

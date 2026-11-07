@@ -101,13 +101,44 @@ def debug_log(msg: str):
         pass
 
 
+def heal_usb_power_state():
+    """Ensures USB autosuspend is disabled and power/control is 'on' for Goodix GM168."""
+    try:
+        for pctrl in glob.glob("/sys/bus/usb/devices/*/power/control"):
+            devdir = os.path.dirname(os.path.dirname(pctrl))
+            if os.path.exists(os.path.join(devdir, "idVendor")) and os.path.exists(os.path.join(devdir, "idProduct")):
+                try:
+                    with open(os.path.join(devdir, "idVendor"), "r") as f:
+                        vid = f.read().strip()
+                    with open(os.path.join(devdir, "idProduct"), "r") as f:
+                        pid = f.read().strip()
+                    if vid == "27c6" and pid in ("581a", "589a"):
+                        with open(pctrl, "w") as f:
+                            f.write("on")
+                        autos = os.path.join(devdir, "power/autosuspend")
+                        if os.path.exists(autos):
+                            with open(autos, "w") as f:
+                                f.write("-1")
+                        persist = os.path.join(devdir, "power/persist")
+                        if os.path.exists(persist):
+                            with open(persist, "w") as f:
+                                f.write("1")
+                        debug_log(f"Healed USB power state for Goodix device at {devdir}")
+                except Exception:
+                    pass
+    except Exception as e:
+        debug_log(f"USB power heal warning: {e}")
+
+
 def ensure_fprintd_stopped():
     """Prevents USB device contention with conflicting background fprintd service."""
+    heal_usb_power_state()
     try:
         subprocess.run(["systemctl", "stop", "fprintd.service"], capture_output=True, timeout=2)
         subprocess.run(["systemctl", "mask", "fprintd.service"], capture_output=True, timeout=2)
     except Exception:
         pass
+
 
 
 def get_psk_directory() -> str:
@@ -195,13 +226,15 @@ def capture_sensor_touch() -> bool:
             debug_log(f"Probe frame captured successfully ({os.path.getsize(OUT_FRAME)} bytes).")
             return True
 
-        if retcode == 1:
-            debug_log("Capture attempt 1 encountered USB/TLS glitch. Retrying after brief settle...")
-            time.sleep(0.2)
+        if retcode != 0:
+            debug_log("Capture attempt 1 encountered USB/TLS glitch. Healing power state & retrying...")
+            heal_usb_power_state()
+            time.sleep(0.3)
             success, retcode = _exec_single_capture(env, timeout_sec=10)
             if success:
                 debug_log(f"Probe frame captured on retry ({os.path.getsize(OUT_FRAME)} bytes).")
                 return True
+
 
         user_msg("⏱️ Fingerprint sensor timed out.")
         debug_log(f"Sensor acquisition ended without valid frame (exit={retcode}).")
